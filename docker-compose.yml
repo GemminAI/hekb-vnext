@@ -1,0 +1,16 @@
+services:
+  hekb-vnext:
+    build: .
+    image: hekb-vnext:latest
+    container_name: hekb-vnext
+    environment:
+      - HEKB_HOST=0.0.0.0
+      - HEKB_PORT=8300
+      - HEKB_DATA_DIR=/app/experience
+    ports:
+      # Bound to loopback only, matching the product's outbound-communication-zero
+      # design (My_LLM_Builder_App_SPEC.md §3.3) even though the process inside
+      # the container listens on 0.0.0.0 for the Docker bridge network.
+      - "127.0.0.1:8300:8300"
+    volumes:
+      - ./experience:/app/experience

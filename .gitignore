@@ -1,0 +1,30 @@
+# Experience store data (content-addressed objects, lineages, relations) —
+# runtime state, never source. Keep directory scaffolding via .gitkeep.
+experience/objects/*
+experience/lineages/*
+experience/relations/*
+!experience/objects/.gitkeep
+!experience/lineages/.gitkeep
+!experience/relations/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.*
