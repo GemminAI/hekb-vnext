@@ -1,11 +1,14 @@
-# Experience store data (content-addressed objects, lineages, relations) —
-# runtime state, never source. Keep directory scaffolding via .gitkeep.
+# Experience store data (content-addressed objects, lineages, relations,
+# mutable sidecars) — runtime state, never source. Keep directory
+# scaffolding via .gitkeep.
 experience/objects/*
 experience/lineages/*
 experience/relations/*
+experience/meta/*
 !experience/objects/.gitkeep
 !experience/lineages/.gitkeep
 !experience/relations/.gitkeep
+!experience/meta/.gitkeep
 
 # Python
 __pycache__/
@@ -28,3 +31,7 @@ venv/
 # Env / secrets
 .env
 .env.*
+
+# Dev/test-only signing keys (see tools/dev_audit_signer.py) — never the
+# real Secure Enclave key, but treated as a secret anyway.
+devkeys/
