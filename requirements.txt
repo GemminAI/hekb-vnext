@@ -2,3 +2,9 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 cryptography==49.0.0
+# TrajectoryBlob v2 (SPEC-HEKB-REFACTOR-2026-v2.0 Step 1): only needed as a
+# fallback on Python < 3.14, which lacks the stdlib `compression.zstd`
+# module (PEP 784). This repo's own python3 is 3.14+ and doesn't need it,
+# but consumers running this code under an older interpreter (e.g.
+# sensos/.venv, Python 3.12) do -- see storage/trajectory_blob.py.
+zstandard>=0.25

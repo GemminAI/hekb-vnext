@@ -91,12 +91,15 @@ from contextlib import asynccontextmanager
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 VENDOR_DIR = Path(__file__).resolve().parent / "vendor" / "hekb_vnext"
 if str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from core.category import Category  # noqa: E402
 from core.morphism import MemoryMorphism  # noqa: E402
@@ -107,12 +110,27 @@ from memory.provenance import (  # noqa: E402
     ProvenanceCycleError,
     provenance_path,
 )
+from auth.local_auth import BearerTokenGuard, generate_bearer_token  # noqa: E402
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8300
 DEFAULT_DATA_DIR = "./experience"
 DEFAULT_RECALL_DEPTH = 5
 AUDIT_PUBLIC_KEY_ENV = "HEKB_AUDIT_PUBLIC_KEY_PATH"
+DEFAULT_APP_SUPPORT_DIR = str(Path.home() / "Library" / "Application Support" / "MyLLMBuilder")
+
+# SPEC-HEKB-REFACTOR-2026-v2.0 section 5.3 (Step 2): a NEW transport-auth
+# layer, separate from the existing X-Audit-Signature payload governance
+# below. Applies to every route including /health -- "unauthenticated local
+# HTTP request -> 401" is stated without carving out health checks, and a
+# local ephemeral token costs nothing to check on every call. `_bearer_guard`
+# starts with token=None (fails closed on every request) until `main()` (or
+# a test) generates/loads a real token and assigns `_bearer_guard.token`.
+_bearer_guard = BearerTokenGuard(token=None)
+
+
+def _require_bearer_token(authorization: str | None = Header(None)) -> None:
+    _bearer_guard(authorization)
 
 
 def _data_dir() -> Path:
@@ -271,6 +289,7 @@ app = FastAPI(
     title="hekb-vnext",
     description="HEKB vNext Experience Store — FastAPI wrapper around the vendored HEKB vNext core (T7).",
     lifespan=_lifespan,
+    dependencies=[Depends(_require_bearer_token)],
 )
 
 
@@ -616,17 +635,115 @@ def archive_experience(object_id: str) -> SidecarOut:
     return SidecarOut(**sidecar)
 
 
+# --- SPEC-HEKB-REFACTOR-2026-v2.0 Step 5: post-hoc recalibration API -------
+# New: no `/trajectories/*` route existed in this service before this change.
+
+from index.recalibrate import get_job, new_job_id, run_recalibration_job  # noqa: E402
+
+
+def _trajectories_root() -> Path:
+    return _data_dir() / "trajectories"
+
+
+def _index_db_path() -> Path:
+    return _data_dir() / "indexes" / "hekb_vnext_index.db"
+
+
+class RecalibrateRequest(BaseModel):
+    """[OBSERVED DIFFERENCE, disclosed]: SPEC-HEKB-REFACTOR-2026-v2.0
+    section 4.2's own worked example nests these fields under a
+    `quantizer_config` object. This task's own acceptance-criteria wording
+    ("リクエストパラメータ: codebook_id, k_target (デフォルト: 5), dry_run")
+    asks for them flat instead -- flattened here per that explicit request.
+    `n_pca`/`gamma` are still accepted (the quantizer needs them) but with
+    defaults, so a minimal {codebook_id, dry_run} request also works."""
+    codebook_id: str
+    k_target: int = Field(5, gt=0)
+    n_pca: int = Field(32, gt=0)
+    gamma: float = Field(2.0, gt=1.0)
+    dry_run: bool = True
+
+
+class RecalibrateAccepted(BaseModel):
+    job_id: str
+    status: str
+    estimated_trajectories: int
+
+
+@app.post("/trajectories/recalibrate", response_model=RecalibrateAccepted, status_code=202)
+async def recalibrate_trajectories(body: RecalibrateRequest) -> RecalibrateAccepted:
+    import asyncio
+
+    from index.recalibrate import iter_stored_trajectory_ids
+
+    trajectories_root = _trajectories_root()
+    estimated = len(iter_stored_trajectory_ids(trajectories_root))
+    job_id = new_job_id()
+
+    asyncio.create_task(run_recalibration_job(
+        job_id=job_id,
+        trajectories_root=trajectories_root,
+        index_db_path=_index_db_path(),
+        n_pca=body.n_pca,
+        gamma=body.gamma,
+        k_target=body.k_target,
+        codebook_id=body.codebook_id,
+        dry_run=body.dry_run,
+    ))
+    return RecalibrateAccepted(job_id=job_id, status="PROCESSING", estimated_trajectories=estimated)
+
+
+@app.get("/trajectories/recalibrate/{job_id}")
+def get_recalibration_job(job_id: str) -> dict[str, Any]:
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job_id {job_id!r}")
+    if job.status == "FAILED":
+        raise HTTPException(status_code=500, detail=f"recalibration job {job_id} failed: {job.error}")
+    if job.status == "PROCESSING":
+        return {"job_id": job_id, "status": "PROCESSING"}
+    return job.result
+
+
 def main() -> None:
+    import asyncio
+
     import uvicorn
+
+    from auth.uds_guard import UDSGuardConfig, serve_uds_guard
 
     parser = argparse.ArgumentParser(description="HEKB vNext Experience Store")
     parser.add_argument("--host", default=os.environ.get("HEKB_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("HEKB_PORT", str(DEFAULT_PORT))))
     parser.add_argument("--data-dir", default=os.environ.get("HEKB_DATA_DIR", DEFAULT_DATA_DIR))
+    parser.add_argument("--app-support-dir", default=os.environ.get("HEKB_APP_SUPPORT_DIR", DEFAULT_APP_SUPPORT_DIR))
+    parser.add_argument("--no-uds", action="store_true", help="Skip starting the hekb.sock UDS guard listener.")
     args = parser.parse_args()
 
     os.environ["HEKB_DATA_DIR"] = args.data_dir
-    uvicorn.run(app, host=args.host, port=args.port)
+
+    app_support_dir = Path(args.app_support_dir)
+    token_path = app_support_dir / "hekb.token"
+    token = generate_bearer_token(token_path)
+    _bearer_guard.token = token
+    print(f"[hekb-vnext] TCP loopback Bearer token written to {token_path} (mode 0600)")
+
+    async def _run() -> None:
+        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        server = uvicorn.Server(config)
+        tasks = [asyncio.create_task(server.serve())]
+
+        if not args.no_uds:
+            socket_path = app_support_dir / "hekb.sock"
+            guard_config = UDSGuardConfig(
+                socket_path=socket_path, backend_host=args.host, backend_port=args.port,
+            )
+            await serve_uds_guard(guard_config)
+            print(f"[hekb-vnext] UDS guard listening on {socket_path} (mode 0600, LOCAL_PEERCRED-authorized)")
+
+        await asyncio.gather(*tasks)
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
