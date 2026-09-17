@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import heapq
 import json
 import os
 import re
@@ -322,6 +323,33 @@ class SemanticClosureOut(BaseModel):
     is_minimal_self_contained: bool
 
 
+class MorphismIn(BaseModel):
+    source_id: str
+    target_id: str
+    weight: float = 1.0
+    label: dict[str, Any] | None = None
+
+
+class MorphismOut(BaseModel):
+    morphism_id: str
+    source_id: str
+    target_id: str
+    weight: float
+    label: dict[str, Any]
+
+
+class GeodesicMorphismOut(BaseModel):
+    source: str
+    target: str
+    weight: float
+
+
+class GeodesicOut(BaseModel):
+    path: list[str]
+    total_weight: float
+    morphisms: list[GeodesicMorphismOut]
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _ensure_layout()
@@ -489,7 +517,19 @@ def _build_category() -> Category:
     parent->child edge as a `MemoryMorphism`, reproducing exactly what
     `branch()` registered at write time (same dom/cod payload, same
     `{"op", "context"}` label) — so `morphism_id`s recompute identically and
-    `provenance_path` walks the real graph, not a copy of it."""
+    `provenance_path` walks the real graph, not a copy of it.
+
+    Phase B-③ (SensOS-HEKB-Integration-PhaseA-Design-20260918.md §3) adds a
+    second pass over `relations/*.json`, replaying every persisted relation
+    record — not just branch-derived ones. This is additive and safe to
+    layer on top of the loop above: branch-morphisms already have a
+    `relations/<morphism_id>.json` record too (written by
+    `create_experience()`), so replaying it here recomputes the identical
+    `morphism_id` and `category.add_morphism()` is idempotent
+    (`core/category.py`'s own guarantee) -- no duplicate, no conflict.
+    Explicit morphisms created via `POST /morphisms` (which have no
+    `parent_id` on either endpoint's object record) are only ever
+    reconstructed through this second pass."""
     category = Category()
     for path in _objects_dir().glob("*.json"):
         record = _read_json(path)
@@ -501,6 +541,19 @@ def _build_category() -> Category:
         dom = MemoryObject(payload=parent_record["payload"])
         cod = MemoryObject(payload=record["payload"])
         edge = MemoryMorphism(dom=dom, cod=cod, label={"op": record["op"], "context": record["context"]})
+        category.add_morphism(edge)
+
+    for path in _relations_dir().glob("*.json"):
+        relation = _read_json(path)
+        if relation is None:
+            continue
+        dom_record = _read_json(_object_path(relation["dom"]))
+        cod_record = _read_json(_object_path(relation["cod"]))
+        if dom_record is None or cod_record is None:
+            continue
+        dom = MemoryObject(payload=dom_record["payload"])
+        cod = MemoryObject(payload=cod_record["payload"])
+        edge = MemoryMorphism(dom=dom, cod=cod, label=relation["label"])
         category.add_morphism(edge)
     return category
 
@@ -771,6 +824,130 @@ def experience_closure(object_id: str) -> SemanticClosureOut:
         pushout_wavefront=list(closure.pushout_wavefront),
         is_minimal_self_contained=closure.is_minimal_self_contained,
     )
+
+
+def _morphism_weight(m: MemoryMorphism) -> float:
+    """`weight` lives inside `label` by convention (Phase B-③ design
+    decision, SensOS-HEKB-Integration-PhaseA-Design-20260918.md §3) --
+    `core/morphism.py`'s `MemoryMorphism` dataclass itself has no `weight`
+    field and is not modified to add one. Morphisms with no numeric weight
+    in their label (e.g. ordinary branch() edges, whose label is
+    `{"op": ..., "context": ...}`) default to 1.0, exactly like hekbd's own
+    `POST /v1/morphisms` documents its default."""
+    if isinstance(m.label, dict):
+        weight = m.label.get("weight")
+        if isinstance(weight, int | float):
+            return float(weight)
+    return 1.0
+
+
+@app.post("/morphisms", response_model=MorphismOut, status_code=201)
+def create_morphism(morphism: MorphismIn) -> MorphismOut:
+    """Phase B-③ (SensOS-HEKB-Integration-PhaseA-Design-20260918.md §3):
+    creates an explicit `MemoryMorphism` between two *existing* objects --
+    unlike `branch()` (which always creates a brand-new child object),
+    this links objects that already exist, matching hekbd's own
+    `POST /v1/morphisms`. `Category.add_morphism()` already accepts any
+    `MemoryMorphism`, "not required to have been produced by `branch()`"
+    (`core/category.py`'s own docstring) -- this endpoint is the first
+    caller that exercises that generality. Persisted the same way a
+    branch-morphism already is (`relations/<morphism_id>.json`), replayed
+    by `_build_category()`'s second pass."""
+    _ensure_layout()
+    source_record = _read_json(_object_path(morphism.source_id))
+    if source_record is None:
+        raise HTTPException(status_code=404, detail=f"source_id {morphism.source_id!r} not found")
+    target_record = _read_json(_object_path(morphism.target_id))
+    if target_record is None:
+        raise HTTPException(status_code=404, detail=f"target_id {morphism.target_id!r} not found")
+
+    dom = MemoryObject(payload=source_record["payload"])
+    cod = MemoryObject(payload=target_record["payload"])
+    label: dict[str, Any] = {**(morphism.label or {}), "weight": morphism.weight}
+    edge = MemoryMorphism(dom=dom, cod=cod, label=label)
+
+    _write_json_atomic(
+        _relation_path(edge.morphism_id),
+        {"morphism_id": edge.morphism_id, "dom": dom.object_id, "cod": cod.object_id, "label": label},
+    )
+
+    return MorphismOut(
+        morphism_id=edge.morphism_id,
+        source_id=dom.object_id,
+        target_id=cod.object_id,
+        weight=morphism.weight,
+        label=label,
+    )
+
+
+@app.get("/graph/geodesic", response_model=GeodesicOut)
+def graph_geodesic(
+    source_id: str = Query(..., description="Object id to start from."),
+    target_id: str = Query(..., description="Object id to reach."),
+) -> GeodesicOut:
+    """Phase B-③ (SensOS-HEKB-Integration-PhaseA-Design-20260918.md §3):
+    weighted shortest path, ported from hekbd's `cpp/src/query/
+    query.cpp::geodesic()` -- same Dijkstra structure (a min-priority
+    queue keyed on accumulated cost, a `best`/`came_from` pair for path
+    reconstruction), operating over `_build_category()`'s graph instead of
+    hekbd's own `graph::Index`. Cost per edge is `_morphism_weight()`
+    (`label.get("weight", 1.0)`), never a hop count -- this is a real
+    weighted geodesic, not `/experience/recall`'s unweighted ancestor
+    walk. Pure read: no write of any kind."""
+    _ensure_layout()
+    if _read_json(_object_path(source_id)) is None:
+        raise HTTPException(status_code=404, detail=f"source_id {source_id!r} not found")
+    if _read_json(_object_path(target_id)) is None:
+        raise HTTPException(status_code=404, detail=f"target_id {target_id!r} not found")
+
+    category = _build_category()
+
+    if source_id == target_id:
+        return GeodesicOut(path=[source_id], total_weight=0.0, morphisms=[])
+
+    best: dict[str, float] = {source_id: 0.0}
+    came_from: dict[str, tuple[str, MemoryMorphism]] = {}
+    frontier: list[tuple[float, str]] = [(0.0, source_id)]
+
+    while frontier:
+        cost, current_id = heapq.heappop(frontier)
+        if current_id == target_id:
+            break
+        if cost > best.get(current_id, float("inf")):
+            continue  # stale queue entry, already improved upon
+
+        current_record = _read_json(_object_path(current_id))
+        if current_record is None:
+            continue
+        current_obj = MemoryObject(payload=current_record["payload"])
+
+        for edge in category.morphisms_from(current_obj):
+            candidate = cost + _morphism_weight(edge)
+            next_id = edge.cod.object_id
+            if candidate < best.get(next_id, float("inf")):
+                best[next_id] = candidate
+                came_from[next_id] = (current_id, edge)
+                heapq.heappush(frontier, (candidate, next_id))
+
+    if target_id not in best:
+        raise HTTPException(
+            status_code=404, detail=f"no path from {source_id!r} to {target_id!r}"
+        )
+
+    path: list[str] = [target_id]
+    morphisms: list[GeodesicMorphismOut] = []
+    cursor = target_id
+    while cursor in came_from:
+        previous_id, edge = came_from[cursor]
+        morphisms.append(
+            GeodesicMorphismOut(source=previous_id, target=cursor, weight=_morphism_weight(edge))
+        )
+        path.append(previous_id)
+        cursor = previous_id
+    path.reverse()
+    morphisms.reverse()
+
+    return GeodesicOut(path=path, total_weight=best[target_id], morphisms=morphisms)
 
 
 # --- SPEC-HEKB-REFACTOR-2026-v2.0 Step 5: post-hoc recalibration API -------
