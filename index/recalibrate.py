@@ -43,6 +43,7 @@ into ONE semantic address, or what "recalibrate" fits its PCA on):
 """
 from __future__ import annotations
 
+import logging
 import sys
 import time
 import uuid
@@ -52,11 +53,34 @@ from typing import Any
 
 import numpy as np
 
-sys.path.insert(0, "/Users/tomonam3/Projects/sensos/experiments/EXP-BABY-MAC005")
-from mac005_quantizer import UltrametricQuantizer, k_match  # noqa: E402
-
 from storage.trajectory_blob import trajectory_path  # noqa: E402
 from index.semantic_index import connect, get_address, latest_address_any_codebook, upsert_address  # noqa: E402
+
+_logger = logging.getLogger(__name__)
+
+# EXP-BABY-MAC005 was archived off this Mac to SSD1TB storage (see
+# Projects/sensos commit 7e29fe5, "moved to SSD1TB archive") and is not
+# guaranteed to be present on every machine or container this service runs
+# on. Importing it is therefore optional: a missing quantizer must degrade
+# /trajectories/recalibrate to a clean per-job failure, not crash this
+# service's startup for every other endpoint. Restore the archive and this
+# import succeeds again with no other code change required.
+_MAC005_QUANTIZER_PATH = "/Users/tomonam3/Projects/sensos/experiments/EXP-BABY-MAC005"
+
+try:
+    sys.path.insert(0, _MAC005_QUANTIZER_PATH)
+    from mac005_quantizer import UltrametricQuantizer, k_match  # noqa: E402
+except ImportError as exc:
+    _logger.warning(
+        "mac005_quantizer unavailable at %r (%s) -- POST /trajectories/recalibrate "
+        "will report every job as FAILED with this reason instead of crashing "
+        "this service at import time. Restore EXP-BABY-MAC005 from its SSD1TB "
+        "archive to re-enable this endpoint.",
+        _MAC005_QUANTIZER_PATH,
+        exc,
+    )
+    UltrametricQuantizer = None  # type: ignore[assignment]
+    k_match = None  # type: ignore[assignment]
 
 
 def iter_stored_trajectory_ids(trajectories_root: Path) -> list[str]:
@@ -102,6 +126,12 @@ async def run_recalibration_job(
     job = RecalibrationJob(job_id=job_id)
     _JOBS[job_id] = job
     try:
+        if UltrametricQuantizer is None or k_match is None:
+            raise RuntimeError(
+                f"mac005_quantizer is not available in this deployment (expected at "
+                f"{_MAC005_QUANTIZER_PATH!r}); /trajectories/recalibrate cannot run "
+                "until it is restored from the SSD1TB archive."
+            )
         object_ids = iter_stored_trajectory_ids(trajectories_root)
         object_vectors: dict[str, np.ndarray] = {}
         from storage.trajectory_blob import read_trajectory
