@@ -37,8 +37,14 @@ RUN mkdir -p /app/experience/objects /app/experience/relations /app/experience/l
 
 EXPOSE 8300
 
+# The local transport-auth Bearer guard (auth/local_auth.py) applies to
+# EVERY route including /health, not just POST /experience -- an
+# unauthenticated healthcheck gets a real 401, not a pass. main() writes
+# the token to $HEKB_APP_SUPPORT_DIR/hekb.token at startup; read it fresh
+# on each check rather than baking a value in, since it's regenerated
+# every container start.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
-    CMD curl -f http://localhost:8300/health || exit 1
+    CMD curl -sf -H "Authorization: Bearer $(cat /app/app_support/hekb.token)" http://localhost:8300/health || exit 1
 
 # --no-uds: the Unix Domain Socket / LOCAL_PEERCRED listener
 # (auth/uds_guard.py) is for same-host, non-networked local IPC and has no

@@ -2,6 +2,12 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 cryptography==49.0.0
+# index/recalibrate.py's own pairwise/pooling math (np.asarray, np.stack,
+# np.mean) -- unconditional, independent of whether mac005_quantizer is
+# available. Missing from this file until 2026-09-17 (found by actually
+# running the container, not just import-checking on the host, where a
+# numpy already installed for other reasons on the Mac masked the gap).
+numpy>=1.26
 # TrajectoryBlob v2 (SPEC-HEKB-REFACTOR-2026-v2.0 Step 1): only needed as a
 # fallback on Python < 3.14, which lacks the stdlib `compression.zstd`
 # module (PEP 784). This repo's own python3 is 3.14+ and doesn't need it,
