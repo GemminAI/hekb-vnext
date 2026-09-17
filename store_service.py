@@ -112,6 +112,7 @@ from memory.provenance import (  # noqa: E402
     provenance_path,
 )
 from auth.local_auth import BearerTokenGuard, generate_bearer_token  # noqa: E402
+from index.semantic_closure import compute_closure  # noqa: E402
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8300
@@ -293,6 +294,32 @@ class NearestMatch(BaseModel):
 
 class NearestOut(BaseModel):
     matches: list[NearestMatch]
+
+
+class ClosureObjectOut(BaseModel):
+    id: str
+
+
+class ClosureMorphismOut(BaseModel):
+    id: str
+    source: str
+    target: str
+    kind: str
+
+
+class DerivedCompositionOut(BaseModel):
+    morphism: str
+    formula: str
+
+
+class SemanticClosureOut(BaseModel):
+    query_object_id: str
+    objects: list[ClosureObjectOut]
+    morphisms: list[ClosureMorphismOut]
+    derived_compositions: list[DerivedCompositionOut]
+    pullback_roots: list[str]
+    pushout_wavefront: list[str]
+    is_minimal_self_contained: bool
 
 
 @asynccontextmanager
@@ -709,6 +736,41 @@ def archive_experience(object_id: str) -> SidecarOut:
     sidecar["archived"] = True
     _write_json_atomic(_meta_path(object_id), sidecar)
     return SidecarOut(**sidecar)
+
+
+@app.get("/experience/{object_id}/closure", response_model=SemanticClosureOut)
+def experience_closure(object_id: str) -> SemanticClosureOut:
+    """Phase B-② of the hekb-vnext integration plan
+    (SensOS-HEKB-Integration-PhaseA-Design-20260918.md §2): the Semantic
+    Closure Query ported from `GemminAI/hekb`'s EXP-HEKB002/003
+    (`index/semantic_closure.py`, this service's own port). Pure read:
+    reuses `_build_category()` unmodified (the same graph `/experience/
+    recall` already reconstructs from every stored parent->child edge),
+    no write of any kind. Categorical retrieval, not vector search -- see
+    `index/semantic_closure.py`'s own module docstring for the algorithm
+    and for the adaptations made from the origin implementation."""
+    _ensure_layout()
+    if _read_json(_object_path(object_id)) is None:
+        raise HTTPException(status_code=404, detail=f"object_id {object_id!r} not found")
+
+    category = _build_category()
+    closure = compute_closure(category, object_id)
+
+    return SemanticClosureOut(
+        query_object_id=closure.query_object_id,
+        objects=[ClosureObjectOut(id=o.id) for o in closure.objects],
+        morphisms=[
+            ClosureMorphismOut(id=m.id, source=m.source, target=m.target, kind=m.kind)
+            for m in closure.morphisms
+        ],
+        derived_compositions=[
+            DerivedCompositionOut(morphism=d.morphism, formula=d.formula)
+            for d in closure.derived_compositions
+        ],
+        pullback_roots=list(closure.pullback_roots),
+        pushout_wavefront=list(closure.pushout_wavefront),
+        is_minimal_self_contained=closure.is_minimal_self_contained,
+    )
 
 
 # --- SPEC-HEKB-REFACTOR-2026-v2.0 Step 5: post-hoc recalibration API -------
