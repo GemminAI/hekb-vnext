@@ -82,6 +82,7 @@ import json
 import os
 import re
 import sys
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -277,6 +278,21 @@ class GraphEdgeOut(BaseModel):
 class GraphTopologyOut(BaseModel):
     nodes: list[GraphNodeOut]
     edges: list[GraphEdgeOut]
+
+
+class NearestQuery(BaseModel):
+    vector: list[float]
+    limit: int = 10
+    metric: str = "cosine"
+
+
+class NearestMatch(BaseModel):
+    object_id: str
+    distance: float
+
+
+class NearestOut(BaseModel):
+    matches: list[NearestMatch]
 
 
 @asynccontextmanager
@@ -601,6 +617,66 @@ def graph_topology(
     edges.sort(key=lambda e: (e.source, e.target))
 
     return GraphTopologyOut(nodes=nodes, edges=edges)
+
+
+def _cosine_distance(a: list[float], b: list[float]) -> float:
+    """Ported from `hekb`'s `cpp/src/query/query.cpp::cosineDistance()`
+    (`GemminAI/hekb`, `cpp/src/query/query.cpp`), same formula, same
+    max-distance (2.0) fallback for a zero vector (cosine is undefined for
+    one, and 2.0 -- the metric's own max -- cannot mislead a caller into
+    treating it as a close match)."""
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 2.0
+    similarity = dot / (norm_a * norm_b)
+    return 1.0 - max(-1.0, min(1.0, similarity))
+
+
+def _euclidean_distance(a: list[float], b: list[float]) -> float:
+    """Ported from `hekb`'s `cpp/src/query/query.cpp::euclideanDistance()`."""
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b, strict=True)))
+
+
+@app.post("/query/nearest", response_model=NearestOut)
+def query_nearest(query: NearestQuery) -> NearestOut:
+    """Brute-force nearest-neighbour search over every stored experience's
+    `payload.ext.centroid` (falling back to `payload.ext.vector`) --
+    ported from `hekb`'s `cpp/src/query/query.cpp::nearest()`: same two
+    metrics, same full-scan-no-index approach (SensOS-HEKB-Integration-
+    PhaseA-Design-20260918.md §1). No embedding is generated here; this
+    only ever reads a vector a caller already wrote into `payload.ext`
+    (e.g. `msr.abi.StabilizedTrajectory.centroid`, see
+    `tests/e2e/test_minimal_loop.py` in `GemminAI/sensos`) --
+    `ExperiencePayload`'s schema (`extra="forbid"`) is not touched by this
+    endpoint. Objects whose candidate vector is missing or a different
+    dimension than the probe are silently skipped, matching hekb's own
+    `object.vector.size() != probe.size()` skip rule."""
+    if query.metric not in ("cosine", "euclidean"):
+        raise HTTPException(status_code=422, detail="metric must be 'cosine' or 'euclidean'")
+    if not query.vector or query.limit <= 0:
+        return NearestOut(matches=[])
+
+    distance_fn = _cosine_distance if query.metric == "cosine" else _euclidean_distance
+
+    _ensure_layout()
+    matches: list[NearestMatch] = []
+    for path in _objects_dir().glob("*.json"):
+        record = _read_json(path)
+        if record is None:
+            continue
+        ext = record["payload"].get("ext") or {}
+        candidate = ext.get("centroid") or ext.get("vector")
+        if candidate is None or len(candidate) != len(query.vector):
+            continue
+        distance = distance_fn(query.vector, candidate)
+        matches.append(NearestMatch(object_id=record["object_id"], distance=distance))
+
+    # Ties break on object_id so repeated queries return identical ordering,
+    # matching hekb's own `query.cpp` ranking rule.
+    matches.sort(key=lambda m: (m.distance, m.object_id))
+    return NearestOut(matches=matches[: query.limit])
 
 
 @app.post("/experience/{object_id}/recall", response_model=SidecarOut)
