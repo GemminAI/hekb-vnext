@@ -85,7 +85,15 @@ MAGIC = b"TRJ_V2"
 FORMAT_VERSION = 0x0002
 DTYPE_FLOAT32 = 0x02
 ENDIANNESS_LITTLE = 0x01
-DIMENSIONS = 256          # fixed: every real dataset inspected (MAC001/002/004) is 256-dim.
+DIMENSIONS = 256          # default/legacy: every MAC001/002/004 dataset inspected is 256-dim.
+                          # [HEKBV3-BUILD001, disclosed]: the on-disk header already carries
+                          # `dimensions` as a variable uint16 field (not a fixed magic constant),
+                          # so this format is dimension-agnostic by construction; only the
+                          # encode-side validation below used to hardcode 256. Generalized so
+                          # the identical header/zstd/tail format can be reused for NVS's 64-D
+                          # Trajectory positions (HEKBv3 改修設計書 v0.1 §3.3 Layer 4) without a
+                          # new blob format. `DIMENSIONS` is kept only as the legacy default
+                          # for callers that don't pass `dimensions` explicitly.
 DEFAULT_STEPS = 128       # the spec's own worked example (128 steps x 256 dims = 32,768 elements / 128KB).
 HEADER_SIZE = 128
 TAIL_SIZE = 32
@@ -128,7 +136,7 @@ class TrajectoryBlobHeader:
         return self.trajectory_id.hex()
 
 
-def _flatten_to_float32_bytes(points: list[list[float]]) -> tuple[bytes, int]:
+def _flatten_to_float32_bytes(points: list[list[float]], dimensions: int) -> tuple[bytes, int]:
     """points: steps x dimensions (row-major), any numeric type -> (raw
     little-endian float32 bytes, steps). `steps` is whatever len(points) is
     -- not assumed to be 128 (see module docstring)."""
@@ -137,34 +145,39 @@ def _flatten_to_float32_bytes(points: list[list[float]]) -> tuple[bytes, int]:
         raise TrajectoryBlobError("trajectory has zero steps")
     flat = []
     for row in points:
-        if len(row) != DIMENSIONS:
-            raise TrajectoryBlobError(f"expected {DIMENSIONS} dims per step, got {len(row)}")
+        if len(row) != dimensions:
+            raise TrajectoryBlobError(f"expected {dimensions} dims per step, got {len(row)}")
         flat.extend(row)
-    return struct.pack(f"<{steps * DIMENSIONS}f", *flat), steps
+    return struct.pack(f"<{steps * dimensions}f", *flat), steps
 
 
-def _unflatten_from_float32_bytes(raw: bytes, steps: int) -> list[list[float]]:
-    element_count = steps * DIMENSIONS
+def _unflatten_from_float32_bytes(raw: bytes, steps: int, dimensions: int) -> list[list[float]]:
+    element_count = steps * dimensions
     flat = struct.unpack(f"<{element_count}f", raw)
-    return [list(flat[i * DIMENSIONS:(i + 1) * DIMENSIONS]) for i in range(steps)]
+    return [list(flat[i * dimensions:(i + 1) * dimensions]) for i in range(steps)]
 
 
-def encode_trajectory_blob(points: list[list[float]], created_at_ms: int | None = None) -> tuple[bytes, TrajectoryBlobHeader]:
-    """points: N x 256 real hidden-state trajectory -> (file_bytes, header).
-    trajectory_id is derived from the raw float32 payload (post-cast, since
-    that IS what's persisted) -- not from the caller's original float64
-    values, matching the spec's own formula 'SHA256(Raw Payload Bytes)'."""
-    raw_payload, steps = _flatten_to_float32_bytes(points)
-    expected_size = steps * DIMENSIONS * 4
+def encode_trajectory_blob(
+    points: list[list[float]], created_at_ms: int | None = None, dimensions: int = DIMENSIONS,
+) -> tuple[bytes, TrajectoryBlobHeader]:
+    """points: N x `dimensions` real trajectory -> (file_bytes, header). Defaults to 256-D
+    (legacy MAC00x callers); pass `dimensions=64` for NVS Trajectory positions, etc. --
+    see the generalization note above `DIMENSIONS`. trajectory_id is derived from the raw
+    float32 payload (post-cast, since that IS what's persisted) -- not from the caller's
+    original float64 values, matching the spec's own formula 'SHA256(Raw Payload Bytes)'."""
+    raw_payload, steps = _flatten_to_float32_bytes(points, dimensions)
+    expected_size = steps * dimensions * 4
     if len(raw_payload) != expected_size:
         raise TrajectoryBlobError(f"internal error: payload size {len(raw_payload)} != {expected_size}")
     if steps > 0xFFFF:
         raise TrajectoryBlobError(f"steps={steps} exceeds uint16 range for the header field")
+    if dimensions > 0xFFFF:
+        raise TrajectoryBlobError(f"dimensions={dimensions} exceeds uint16 range for the header field")
 
     trajectory_id = hashlib.sha256(raw_payload).digest()
     header = TrajectoryBlobHeader(
         trajectory_id=trajectory_id,
-        dimensions=DIMENSIONS,
+        dimensions=dimensions,
         steps=steps,
         created_at_ms=created_at_ms if created_at_ms is not None else int(time.time() * 1000),
     )
@@ -199,8 +212,9 @@ def decode_trajectory_blob(file_bytes: bytes) -> tuple[list[list[float]], Trajec
         raise TrajectoryBlobError(f"unsupported format_version: {format_version}")
     if dtype != DTYPE_FLOAT32 or endianness != ENDIANNESS_LITTLE:
         raise TrajectoryBlobError(f"unsupported dtype/endianness: {dtype}/{endianness}")
-    if dimensions != DIMENSIONS:
-        raise TrajectoryBlobError(f"unsupported dimensions: {dimensions} (expected {DIMENSIONS})")
+    # dimensions is read from the header's own variable field, not asserted against a global
+    # (see the generalization note above `DIMENSIONS`) -- any dimensionality this format's
+    # uint16 field can hold decodes correctly.
 
     expected_size = dimensions * steps * 4
     raw_payload = zstd.decompress(compressed_payload)
@@ -220,7 +234,7 @@ def decode_trajectory_blob(file_bytes: bytes) -> tuple[list[list[float]], Trajec
         created_at_ms=created_at_ms, format_version=format_version,
         dtype=dtype, endianness=endianness,
     )
-    return _unflatten_from_float32_bytes(raw_payload, steps), header
+    return _unflatten_from_float32_bytes(raw_payload, steps, dimensions), header
 
 
 def trajectory_path(trajectories_root: Path, trajectory_id_hex: str) -> Path:
@@ -229,8 +243,11 @@ def trajectory_path(trajectories_root: Path, trajectory_id_hex: str) -> Path:
     return trajectories_root / trajectory_id_hex[:2] / trajectory_id_hex[2:4] / f"trj_{trajectory_id_hex}.bin.zst"
 
 
-def write_trajectory(trajectories_root: Path, points: list[list[float]], created_at_ms: int | None = None) -> TrajectoryBlobHeader:
-    file_bytes, header = encode_trajectory_blob(points, created_at_ms=created_at_ms)
+def write_trajectory(
+    trajectories_root: Path, points: list[list[float]], created_at_ms: int | None = None,
+    dimensions: int = DIMENSIONS,
+) -> TrajectoryBlobHeader:
+    file_bytes, header = encode_trajectory_blob(points, created_at_ms=created_at_ms, dimensions=dimensions)
     path = trajectory_path(trajectories_root, header.trajectory_id_hex)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
