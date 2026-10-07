@@ -17,6 +17,25 @@ behaviour, corrected here). alpha defaults to 1/K (`compose()`'s `laplace_alpha`
 overrides it); there is no separate epsilon floor for "entirely absent from top_m" --
 such a category receives the same alpha as any other, per the corrected formula
 p(c) = (sum_{i in top_m} w_i*1[c_i=c] + alpha) / (1 + K*alpha).
+
+[HEKBV3-BUILD001 差分3, disclosed]: `posterior_mode` (default "alpha_over_k", unchanged)
+adds an alternative, OPTIONAL R3 formula to let evaluation scripts reproduce the Mac-side
+P0 reference's (EXP-HEKBv3 code/engine.py) posterior literally, for diagnostic comparison
+only -- it is never selected by default and no existing caller passes it:
+"p0_ne_add_one" computes p(c) = (n_eff * sum_{i in top_m} w_i*1[c_i=c] + 1) / (n_eff + K),
+i.e. classic add-one Laplace smoothing applied to a weighted count rescaled by the
+softmax's own effective sample size n_eff (P0 engine.py lines ~411-412), rather than this
+build's alpha=1/K smoothing of the (always-sums-to-1) raw softmax weights. The two
+formulas agree only in the special case alpha=1/n_eff; in general P0's n_eff-scaled
+version is far more confident whenever n_eff is large and the top_m already carries any
+real signal above chance, which is the single largest identified contributor to the gap
+between this build's category log-loss and P0's reported "31.7% reduction" figure.
+
+`skip_r1` (default False, unchanged): when True, skips the R1 position-blob decode and
+tangent-space blend entirely (value_by_horizon becomes {h: None for h in HORIZONS}) -- a
+performance-only opt-in for callers that need only R3 (category posterior) over many
+thousands of queries, where re-decoding up to top_m position blobs per call is otherwise
+the dominant cost. No existing caller passes it; the HTTP route's behaviour is unchanged.
 """
 from __future__ import annotations
 
@@ -102,6 +121,8 @@ def compose(
     exclude_groups: set[str] | None = None,
     exclude_object_ids: set[str] | None = None,
     laplace_alpha: float | None = None,
+    posterior_mode: str = "alpha_over_k",
+    skip_r1: bool = False,
 ) -> ComposeResult:
     exclude_groups = exclude_groups or set()
     exclude_object_ids = exclude_object_ids or set()
@@ -134,12 +155,13 @@ def compose(
     chosen_entries = [kept_entries[i] for i in top_idx]
     weights_list = weights_top.tolist()
 
-    cache = _PositionCache(objects_dir, blobs_root)
-    query_positions = cache.positions(query_object_id)
-    x_t = query_positions[query_token_index] / np.linalg.norm(query_positions[query_token_index])
+    value_by_horizon: dict[int, list[float] | None] = {h: None for h in HORIZONS}
+    if not skip_r1:
+        cache = _PositionCache(objects_dir, blobs_root)
+        query_positions = cache.positions(query_object_id)
+        x_t = query_positions[query_token_index] / np.linalg.norm(query_positions[query_token_index])
 
-    value_by_horizon: dict[int, list[float] | None] = {}
-    for h in HORIZONS:
+    for h in HORIZONS if not skip_r1 else ():
         v_sum = np.zeros_like(x_t)
         w_sum = 0.0
         for w, e in zip(weights_list, chosen_entries):
@@ -181,10 +203,16 @@ def compose(
     for w, e in zip(weights_list, chosen_entries):
         category_counts[e["category"]] = category_counts.get(e["category"], 0.0) + w
     total_w = sum(weights_list)  # == 1.0 by softmax construction, kept explicit for clarity
-    posterior = {
-        c: (category_counts[c] + alpha) / (total_w + k_cat * alpha)
-        for c in all_library_categories
-    }
+    if posterior_mode == "p0_ne_add_one":
+        posterior = {
+            c: (n_eff * category_counts[c] + 1.0) / (n_eff + k_cat)
+            for c in all_library_categories
+        }
+    else:
+        posterior = {
+            c: (category_counts[c] + alpha) / (total_w + k_cat * alpha)
+            for c in all_library_categories
+        }
 
     return ComposeResult(
         weights=weights_list,
