@@ -1211,15 +1211,27 @@ class ComposeOut(BaseModel):
     category_posterior: dict[str, float]
 
 
-def _default_temperature(keys: np.ndarray, k: int = 16) -> float:
+def _default_temperature(keys: np.ndarray, k: int = 16, max_n: int = 2000, seed: int = 0) -> float:
     """EXP-HEKBv3_実験設計_v0.1 §(M2): 'T0 = 訓練側の query の、16番目の近傍までの距離の二乗の中央値.'
     Computed self-referentially over the library passed in (already exclude-filtered by
-    the caller) -- this build has no separate train/val split to draw T0 from."""
+    the caller) -- this build has no separate train/val split to draw T0 from.
+
+    [HEKBV3-BUILD001, disclosed]: the naive (n, n, d) broadcast materializes an array of
+    size n*n*d -- observed to need 36.5 GiB and crash at n=12,471 (TRJ003's real per-token
+    index). Rewritten with the ||a-b||^2 = ||a||^2 + ||b||^2 - 2a.b expansion, which needs
+    only an (n, n) matrix (BLAS-backed), and additionally subsamples down to `max_n` rows
+    (fixed seed, so T0 is still reproducible, K8) when the library is larger than that --
+    a kNN-bandwidth estimate does not need every point, only enough of them."""
     n = keys.shape[0]
+    if n > max_n:
+        rng = np.random.default_rng(seed)
+        keys = keys[rng.choice(n, size=max_n, replace=False)]
+        n = max_n
     kk = min(k, n - 1)
     if kk < 1:
         return 1.0
-    d2 = np.sum((keys[:, None, :] - keys[None, :, :]) ** 2, axis=-1)
+    sq_norms = np.sum(keys ** 2, axis=1)
+    d2 = sq_norms[:, None] + sq_norms[None, :] - 2.0 * (keys @ keys.T)
     np.fill_diagonal(d2, np.inf)
     kth = np.partition(d2, kk - 1, axis=1)[:, kk - 1]
     return float(np.median(kth)) or 1.0
