@@ -1197,6 +1197,7 @@ class ComposeIn(BaseModel):
     temperature: float | None = Field(None, description="T; if omitted, a kNN-bandwidth default is computed from the (post-exclude) library.")
     top_m: int = 64
     exclude: ComposeExclude = Field(default_factory=ComposeExclude)
+    laplace_alpha: float | None = Field(None, description="R3 smoothing alpha; defaults to 1/K (K = categories in the post-exclude library).")
 
 
 class ComposeOut(BaseModel):
@@ -1293,6 +1294,7 @@ def compose_route(body: ComposeIn) -> ComposeOut:
             objects_dir=_objects_dir(), blobs_root=_blobs_dir(),
             temperature=temperature, top_m=body.top_m,
             exclude_groups=exclude_groups, exclude_object_ids=exclude_object_ids,
+            laplace_alpha=body.laplace_alpha,
         )
     except compose_mod.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

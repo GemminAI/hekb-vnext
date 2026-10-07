@@ -10,8 +10,13 @@ written (no parallel transport, which §4.3 itself does not mention); it is an
 approximation that degrades as library points move further from the query, acceptable for
 "窓の局所の合成のみ" (the design's own stated default scope).
 
-[HEKBV3-BUILD001, disclosed]: R3's Laplace smoothing constant is not given a value by the
-design doc ("ラプラス平滑化" only); EPS_LAPLACE=1e-3 is this implementation's choice.
+[HEKBV3-BUILD001 差分]: R3's Laplace smoothing is applied over every category present in
+the post-exclude library (K categories), including ones absent from top_m -- not just the
+categories that happen to appear among the top_m neighbours (the original build's
+behaviour, corrected here). alpha defaults to 1/K (`compose()`'s `laplace_alpha` param
+overrides it); there is no separate epsilon floor for "entirely absent from top_m" --
+such a category receives the same alpha as any other, per the corrected formula
+p(c) = (sum_{i in top_m} w_i*1[c_i=c] + alpha) / (1 + K*alpha).
 """
 from __future__ import annotations
 
@@ -24,7 +29,6 @@ import numpy as np
 from storage import trajectory_blob
 from storage.blobs import get_blob
 
-EPS_LAPLACE = 1e-3
 HORIZONS = (1, 4, 8)
 
 
@@ -97,6 +101,7 @@ def compose(
     top_m: int = 64,
     exclude_groups: set[str] | None = None,
     exclude_object_ids: set[str] | None = None,
+    laplace_alpha: float | None = None,
 ) -> ComposeResult:
     exclude_groups = exclude_groups or set()
     exclude_object_ids = exclude_object_ids or set()
@@ -163,15 +168,22 @@ def compose(
             x_pred = exp_map(x_t, v_tangent)
             value_by_horizon[h] = x_pred.tolist()
 
-    category_counts: dict[str, float] = {}
+    # R3 (HEKBV3-BUILD001 差分, §4.5): Laplace smoothing is applied over every category
+    # present in the (post-exclude) LIBRARY -- K distinct categories -- not only the ones
+    # that happen to appear in top_m; a category entirely absent from top_m still gets the
+    # same alpha, rather than falling through to an external epsilon floor (the previous
+    # build's behaviour, now corrected). alpha defaults to 1/K, overridable by the caller.
+    all_library_categories = sorted(set(e["category"] for e in kept_entries))
+    k_cat = max(len(all_library_categories), 1)
+    alpha = laplace_alpha if laplace_alpha is not None else 1.0 / k_cat
+
+    category_counts: dict[str, float] = {c: 0.0 for c in all_library_categories}
     for w, e in zip(weights_list, chosen_entries):
         category_counts[e["category"]] = category_counts.get(e["category"], 0.0) + w
-    categories = sorted(category_counts.keys())
-    n_cat = max(len(categories), 1)
-    total_w = sum(category_counts.values())
+    total_w = sum(weights_list)  # == 1.0 by softmax construction, kept explicit for clarity
     posterior = {
-        c: (category_counts.get(c, 0.0) + EPS_LAPLACE) / (total_w + EPS_LAPLACE * n_cat)
-        for c in categories
+        c: (category_counts[c] + alpha) / (total_w + k_cat * alpha)
+        for c in all_library_categories
     }
 
     return ComposeResult(
