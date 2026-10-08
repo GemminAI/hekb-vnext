@@ -3,18 +3,30 @@ output, /media/psf/HEKBv3/exp_hekbv3_boardrecords/) into a hekb-vnext-v3 data di
 the real /v3/blobs + /v3/trajectories HTTP validation path (blob content-hash check, audit
 signature check, idempotent-by-content object_id) -- never a bypass of that path.
 
-Input layout (per the Mac-side task's own §2/§3):
+Input layout (per the Mac-side task's own §2/§3, plus `model_ref`/`layer` added by the
+2026-10-08 follow-up instruction):
   <root>/manifest.json: {"sessions": [{"session_id","category","group","split","n_records",
     "file"}, ...], "board_format", "quant_step_log2", "format_version", "projection_sha256",
-    "w_sha256", "anchor_policy_sha256", ...commits/sha256s (read but not re-verified here
-    beyond the per-session n_records/anchor_policy_sha256 checks below)}.
+    "w_sha256", "anchor_policy_sha256", "model_ref", "layer", ...commits/sha256s (read but
+    not re-verified here beyond the per-session n_records/anchor_policy_sha256 checks
+    below)}.
   <root>/<file> (e.g. validation48/<session_id>.jsonl.gz or sessions/<session_id>.jsonl.gz):
     one JSON object per line, each BoardRecord.to_wire() (nvs_edge/record.py), in token
     order, over the 32 non-excluded ports (CORE_IDS).
 
-[HEKBV3-BUILD002, disclosed design]: `model_ref` and `layer` are NOT in the manifest field
-list the Mac-side task promises (§2's own enumeration), but /v3/space-id requires both --
-passed here as required CLI flags rather than guessed or defaulted.
+[HEKBV3-BUILD002, 2026-10-08 follow-up, disclosed]: `model_ref`/`layer` are now read FROM
+manifest.json (no longer CLI flags). `model_ref` is REQUIRED to be present; if missing, this
+script substitutes the literal "不明" and reports it (does not stop) -- per the explicit
+instruction, since the identifier lives in the *source* data (MSD0001 meta.json / CDM-DATA001
+selection_manifest.json), not something this script can derive on its own. Confirmed on this
+VM across 3 sessions' own meta.json + CDM-DATA001/selection_manifest.json (TRJ003's own
+manifest.json -- /media/psf/HEKBv3/trj003_48/manifest.json -- has layer_number=32,
+layer_index=7, consistent with the "32、添字7" given directly):
+  model_id = "meta-llama/Llama-3.1-8B-Instruct", revision = "0e9e39f249a16976918f6564b8830bc894c89659"
+(source: /media/psf/EXP-MSD0001 v1.1/sessions/*/meta.json "model" field, and
+/media/psf/sensos-experiments/CDM-DATA001/selection_manifest.json "model" field). `layer` is
+still required with no fallback (its value, 32, is well-established by the same investigation,
+unlike model_ref which is an opaque free-text identifier this script cannot validate).
 
 [HEKBV3-BUILD002, disclosed design]: runs the real store_service ASGI app through
 starlette's TestClient (same mechanism as tests/test_v3_trajectory.py), pointed at
@@ -47,9 +59,15 @@ class IngestError(RuntimeError):
     pass
 
 
-def _load_manifest(manifest_path: Path) -> dict:
+MODEL_REF_UNKNOWN = "不明"
+
+
+def _load_manifest(manifest_path: Path) -> tuple[dict, bool]:
+    """Returns (manifest, model_ref_was_missing). `layer` has no fallback: it is well
+    established (32, layer_index 7 -- see module docstring) and is required to be present.
+    `model_ref` falls back to MODEL_REF_UNKNOWN (reported, not a stop) when absent."""
     manifest = json.loads(manifest_path.read_text())
-    required = ("sessions", "board_format", "quant_step_log2", "anchor_policy_sha256")
+    required = ("sessions", "board_format", "quant_step_log2", "anchor_policy_sha256", "layer")
     missing = [k for k in required if k not in manifest]
     if missing:
         raise IngestError(f"manifest.json missing required field(s): {missing}")
@@ -59,7 +77,10 @@ def _load_manifest(manifest_path: Path) -> dict:
         missing_s = [k for k in ("session_id", "category", "group", "split", "n_records", "file") if k not in s]
         if missing_s:
             raise IngestError(f"manifest.json sessions[{i}] missing field(s): {missing_s}")
-    return manifest
+    model_ref_was_missing = not manifest.get("model_ref")
+    if model_ref_was_missing:
+        manifest = {**manifest, "model_ref": MODEL_REF_UNKNOWN}
+    return manifest, model_ref_was_missing
 
 
 def _read_shard(shard_path: Path) -> list[dict]:
@@ -121,7 +142,7 @@ def _generate_dev_signer():
 
 
 def run_ingest(
-    *, manifest_path: Path, shards_root: Path, data_dir: Path, model_ref: str, layer: int,
+    *, manifest_path: Path, shards_root: Path, data_dir: Path,
     only_session_ids: set[str] | None = None, progress_every: int = 50,
 ) -> dict:
     import os
@@ -139,10 +160,14 @@ def run_ingest(
 
     from storage.trajectory_blob import DTYPE_INT64, encode_trajectory_blob
 
-    manifest = _load_manifest(manifest_path)
+    manifest, model_ref_was_missing = _load_manifest(manifest_path)
     quant_step_log2 = manifest["quant_step_log2"]
     board_format = manifest["board_format"]
     manifest_anchor_policy = manifest["anchor_policy_sha256"]
+    model_ref = manifest["model_ref"]
+    layer = manifest["layer"]
+    if model_ref_was_missing:
+        print(f"[ingest_boardrecords] REPORT: manifest.json has no model_ref; using {MODEL_REF_UNKNOWN!r}", flush=True)
 
     space = {
         "model_ref": model_ref, "layer": layer,
@@ -215,7 +240,10 @@ def run_ingest(
         if i % progress_every == 0 or i == len(sessions):
             print(f"[ingest_boardrecords] {i}/{len(sessions)} sessions ingested", flush=True)
 
-    return {"space_id": space_id, "data_dir": str(data_dir), "n_sessions": len(results), "sessions": results}
+    return {
+        "space_id": space_id, "data_dir": str(data_dir), "n_sessions": len(results), "sessions": results,
+        "model_ref": model_ref, "model_ref_was_missing": model_ref_was_missing, "layer": layer,
+    }
 
 
 def main() -> None:
@@ -225,8 +253,6 @@ def main() -> None:
                          help="Directory the manifest's 'file' entries are relative to (default: manifest's own directory).")
     parser.add_argument("--data-dir", required=True, type=Path,
                          help="HEKB_DATA_DIR for this ingest (no default -- never points at production).")
-    parser.add_argument("--model-ref", required=True)
-    parser.add_argument("--layer", required=True, type=int)
     parser.add_argument("--only", nargs="*", default=None, help="Restrict to these session_ids (default: all in manifest).")
     args = parser.parse_args()
 
@@ -235,7 +261,7 @@ def main() -> None:
     try:
         result = run_ingest(
             manifest_path=args.manifest, shards_root=shards_root, data_dir=args.data_dir,
-            model_ref=args.model_ref, layer=args.layer, only_session_ids=only,
+            only_session_ids=only,
         )
     except IngestError as exc:
         print(f"[ingest_boardrecords] STOP: {exc}", file=sys.stderr)

@@ -57,6 +57,7 @@ def _manifest(sessions: list[dict], **overrides) -> dict:
         "sessions": sessions, "board_format": "36cell/1", "quant_step_log2": -30,
         "format_version": 1, "projection_sha256": "p" * 64, "w_sha256": "w" * 64,
         "anchor_policy_sha256": ANCHOR_POLICY,
+        "model_ref": "toy-model", "layer": 7,
     }
     manifest.update(overrides)
     return manifest
@@ -84,18 +85,42 @@ def test_ingest_end_to_end_and_idempotent(two_sessions, tmp_path, monkeypatch):
 
     result1 = ib.run_ingest(
         manifest_path=manifest_path, shards_root=shards_root, data_dir=data_dir,
-        model_ref="toy-model", layer=7,
     )
     assert result1["n_sessions"] == 2
     object_ids_1 = {s["session_id"]: s["object_id"] for s in result1["sessions"]}
 
     result2 = ib.run_ingest(
         manifest_path=manifest_path, shards_root=shards_root, data_dir=data_dir,
-        model_ref="toy-model", layer=7,
     )
     object_ids_2 = {s["session_id"]: s["object_id"] for s in result2["sessions"]}
     assert object_ids_1 == object_ids_2, "re-running ingest must produce the same object_id (idempotent)"
     assert result1["space_id"] == result2["space_id"]
+
+
+def test_ingest_missing_model_ref_falls_back_and_reports(two_sessions, tmp_path, capsys):
+    manifest_path, shards_root = two_sessions
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["model_ref"]
+    manifest_path.write_text(json.dumps(manifest))
+
+    import ingest_boardrecords as ib
+
+    result = ib.run_ingest(manifest_path=manifest_path, shards_root=shards_root, data_dir=tmp_path / "data")
+    assert result["model_ref"] == ib.MODEL_REF_UNKNOWN
+    assert result["model_ref_was_missing"] is True
+    assert ib.MODEL_REF_UNKNOWN in capsys.readouterr().out
+
+
+def test_ingest_requires_layer(two_sessions, tmp_path):
+    manifest_path, shards_root = two_sessions
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["layer"]
+    manifest_path.write_text(json.dumps(manifest))
+
+    import ingest_boardrecords as ib
+
+    with pytest.raises(ib.IngestError, match="layer"):
+        ib.run_ingest(manifest_path=manifest_path, shards_root=shards_root, data_dir=tmp_path / "data")
 
 
 def test_ingest_stops_on_record_count_mismatch(two_sessions, tmp_path):
@@ -109,7 +134,6 @@ def test_ingest_stops_on_record_count_mismatch(two_sessions, tmp_path):
     with pytest.raises(ib.IngestError, match="n_records"):
         ib.run_ingest(
             manifest_path=manifest_path, shards_root=shards_root, data_dir=tmp_path / "data",
-            model_ref="toy-model", layer=7,
         )
 
 
@@ -130,7 +154,6 @@ def test_ingest_stops_on_inconsistent_anchor_policy(tmp_path):
     with pytest.raises(ib.IngestError, match="anchor_policy_sha256"):
         ib.run_ingest(
             manifest_path=manifest_path, shards_root=shards_root, data_dir=tmp_path / "data",
-            model_ref="toy-model", layer=7,
         )
 
 
@@ -145,7 +168,6 @@ def test_ingest_then_build_index_and_compose(two_sessions, tmp_path, monkeypatch
 
     result = ib.run_ingest(
         manifest_path=manifest_path, shards_root=shards_root, data_dir=data_dir,
-        model_ref="toy-model", layer=7,
     )
     space_id = result["space_id"]
 
