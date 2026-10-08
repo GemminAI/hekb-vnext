@@ -108,6 +108,77 @@ def _post_trajectory(client: TestClient, *, seed: int, category: str, group: str
     return resp, computed_space_id
 
 
+# [HEKBV3-BUILD002] BoardRecord's 32 non-excluded cells (nvs_edge/board.py CORE_IDS):
+# ALL_38 minus these 6 ports.
+_BOARDRECORD_EXCLUDED = ("P05", "P11", "P12", "P17", "P34", "P37")
+CORE_32 = tuple(p for p in ALL_38 if p not in _BOARDRECORD_EXCLUDED)
+QUANT_STEP_LOG2 = -30
+
+
+def _post_trajectory_no_position(client: TestClient, *, seed: int, category: str, group: str,
+                                  space_id: str | None = None, n_steps: int = 20):
+    """[HEKBV3-BUILD002] Like `_post_trajectory`, but with no ext.hekbv3.trajectory (position)
+    field, and a ports blob holding BoardRecord-style already-quantized int64 values over the
+    32 non-excluded cells (dtype=DTYPE_INT64, quant_step_log2 recorded on the ref)."""
+    from storage.trajectory_blob import DTYPE_INT64, encode_trajectory_blob
+
+    rng = np.random.default_rng(seed)
+    scale = 2.0 ** -QUANT_STEP_LOG2
+    ports_rows = [[round(v * scale) for v in row] for row in rng.normal(size=(n_steps, 32)).tolist()]
+
+    file_bytes, _header = encode_trajectory_blob(ports_rows, dimensions=32, dtype=DTYPE_INT64)
+    ports_sha = hashlib.sha256(file_bytes).hexdigest()
+    resp = client.put(f"/v3/blobs/{ports_sha}", content=file_bytes, headers={"Content-Type": "application/octet-stream"})
+    assert resp.status_code == 201, resp.text
+
+    space_resp = client.post("/v3/space-id", json=SPACE)
+    assert space_resp.status_code == 200, space_resp.text
+    computed_space_id = space_id or space_resp.json()["space_id"]
+
+    payload = {
+        "schema": "hekb.experience/2",
+        "raw_input": f"boardrecord seed={seed}",
+        "resolved_meaning": None, "action": None, "title": f"br-{seed}", "tags": ["trj"],
+        "ext": {"hekbv3": {
+            "kind": "trajectory", "origin": "experience",
+            "space": {**SPACE, "space_id": computed_space_id},
+            "ports": {"blob_sha256": ports_sha, "n_steps": n_steps, "dim": 32,
+                      "port_ids": list(CORE_32), "quant_step_log2": QUANT_STEP_LOG2},
+            "labels": {"category": category, "split": "dev", "group": group},
+            "outcome": {"result": "n/a"},
+        }},
+    }
+    sig = client.sign(payload)
+    resp = client.post("/v3/trajectories", json={"payload": payload}, headers={"X-Audit-Signature": sig})
+    return resp, computed_space_id
+
+
+def test_position_less_boardrecord_compose_returns_r3_only(client: TestClient):
+    space_id = None
+    for i in range(6):
+        resp, space_id = _post_trajectory_no_position(client, seed=i, category=f"cat{i % 2}", group=f"g{i}")
+        assert resp.status_code == 201, resp.text
+
+    build_resp = client.post(f"/v3/index/{space_id}/build", json={"L": 8})
+    assert build_resp.status_code == 202, build_resp.text
+    assert build_resp.json()["n_entries"] > 0
+
+    resp0, _ = _post_trajectory_no_position(client, seed=0, category="cat0", group="g0")
+    query_object_id = resp0.json()["object_id"]
+
+    compose_resp = client.post("/v3/compose", json={
+        "space_id": space_id, "query_object_id": query_object_id, "query_token_index": 10,
+        "top_m": 64, "exclude": {"groups": ["g0"]},
+    })
+    assert compose_resp.status_code == 200, compose_resp.text
+    body = compose_resp.json()
+    assert abs(sum(body["weights"]) - 1.0) < 1e-9
+    assert body["category_posterior"]
+    assert set(body["value_by_horizon"].keys()) == {"1", "4", "8"}
+    assert all(v is None for v in body["value_by_horizon"].values()), \
+        "position-less Trajectory must return R3 only (no R1 value_by_horizon)"
+
+
 def test_end_to_end_store_build_compose(client: TestClient):
     space_id = None
     for i in range(6):

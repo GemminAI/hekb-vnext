@@ -120,7 +120,6 @@ from index import compose as compose_mod  # noqa: E402
 from index import experience_index  # noqa: E402
 from index.space_id import SpaceIdError, compute_space_id  # noqa: E402
 from storage import blobs as blob_store  # noqa: E402
-from storage import trajectory_blob  # noqa: E402
 
 API_VERSIONS = ["hekb.experience/1", "hekb.experience/2", "v3-trajectory-experience-channel"]
 
@@ -1127,8 +1126,15 @@ def _require_hekbv3_trajectory_ext(payload: ExperiencePayload) -> dict[str, Any]
             detail=f"payload.ext.hekbv3.space.space_id {space['space_id']!r} does not match "
                     f"the recomputed value {recomputed!r} for the given space fields",
         )
+    # [HEKBV3-BUILD002, disclosed]: `trajectory` (the 64-D position blob, used only by R1)
+    # is now OPTIONAL -- BoardRecord-sourced sessions (nvs-runtime replay executor, no
+    # position series) have no position to carry. `ports` stays required: it is the only
+    # thing build_index() reads (see index/experience_index.py), so dropping it would make
+    # the index unrebuildable from objects+blobs alone.
     for key in ("trajectory", "ports"):
         ref = ext.get(key)
+        if ref is None and key == "trajectory":
+            continue
         if not isinstance(ref, dict) or "blob_sha256" not in ref:
             raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.{key}.blob_sha256 is required")
         if not blob_store.has_blob(_blobs_dir(), ref["blob_sha256"]):
@@ -1269,9 +1275,7 @@ def compose_route(body: ComposeIn) -> ComposeOut:
             raise HTTPException(status_code=409, detail="query_object_id's space_id does not match the target index's space_id [H5]")
         ports_ref = ext["ports"]
         port_ids = ports_ref["port_ids"]
-        blob_bytes = blob_store.get_blob(_blobs_dir(), ports_ref["blob_sha256"])
-        points, _header = trajectory_blob.decode_trajectory_blob(blob_bytes)
-        ports_series = np.asarray(points, dtype=np.float32)
+        ports_series = experience_index.decode_ports_series(ports_ref, _blobs_dir())
         if not (0 <= body.query_token_index < ports_series.shape[0]):
             raise HTTPException(status_code=422, detail=f"query_token_index {body.query_token_index} out of range")
         l = meta["l"]
@@ -1280,8 +1284,14 @@ def compose_route(body: ComposeIn) -> ComposeOut:
         col_idx = [port_ids.index(p) for p in experience_index.ANCHOR_INDEPENDENT_10]
         window = ports_series[body.query_token_index - l + 1: body.query_token_index + 1, col_idx]
         raw_feature = window.reshape(-1)
+        # [HEKBV3-BUILD002, disclosed]: a position-less Trajectory (BoardRecord-sourced,
+        # no ext.hekbv3.trajectory) returns R3 only -- R1 needs each neighbour's own
+        # position series, which doesn't exist here.
+        skip_r1 = "trajectory" not in ext
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=f"query_object_id is missing expected ext.hekbv3 field: {exc}") from exc
+    except experience_index.IndexError_ as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     query_standardized = compose_mod.standardize_query(raw_feature, meta["mean"], meta["std"], meta["kept_dims"])
 
@@ -1295,6 +1305,7 @@ def compose_route(body: ComposeIn) -> ComposeOut:
             temperature=temperature, top_m=body.top_m,
             exclude_groups=exclude_groups, exclude_object_ids=exclude_object_ids,
             laplace_alpha=body.laplace_alpha,
+            skip_r1=skip_r1,
         )
     except compose_mod.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

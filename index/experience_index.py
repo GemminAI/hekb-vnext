@@ -40,6 +40,23 @@ class IndexError_(ValueError):
     pass
 
 
+def decode_ports_series(ports_ref: dict, blobs_root: Path) -> np.ndarray:
+    """[HEKBV3-BUILD002, disclosed]: `ports` blobs may now be stored pre-dequantized
+    (legacy float32, dtype=DTYPE_FLOAT32) or as raw BoardRecord int64 fixed-point values
+    (dtype=DTYPE_INT64, nvs-runtime replay ingestion, §1 'ports の blob は、量子化された
+    int64 のまま保存する（逆量子化は索引の構築時）'). This is the one place that calls
+    dequantize() -- callers always get back float values on the real scale. For int64,
+    `ports_ref["quant_step_log2"]` is required (the blob header has no such field)."""
+    blob_bytes = get_blob(blobs_root, ports_ref["blob_sha256"])
+    points, header = trajectory_blob.decode_trajectory_blob(blob_bytes)
+    if header.dtype == trajectory_blob.DTYPE_INT64:
+        if "quant_step_log2" not in ports_ref:
+            raise IndexError_("ports blob is int64-quantized but ext.hekbv3.ports.quant_step_log2 is missing")
+        step = 2.0 ** ports_ref["quant_step_log2"]
+        return np.asarray(points, dtype=np.float64) * step
+    return np.asarray(points, dtype=np.float32)
+
+
 @dataclass
 class IndexEntry:
     object_id: str
@@ -95,9 +112,7 @@ def build_index(
         if ports_ref is None:
             raise IndexError_(f"object {object_id}: no ext.hekbv3.ports blob reference, cannot build features")
         port_ids = ports_ref["port_ids"]
-        blob_bytes = get_blob(blobs_root, ports_ref["blob_sha256"])
-        points, header = trajectory_blob.decode_trajectory_blob(blob_bytes)
-        ports_series = np.asarray(points, dtype=np.float32)
+        ports_series = decode_ports_series(ports_ref, blobs_root)
         if ports_series.shape[1] != len(port_ids):
             raise IndexError_(f"object {object_id}: ports blob dim {ports_series.shape[1]} != len(port_ids) {len(port_ids)}")
 

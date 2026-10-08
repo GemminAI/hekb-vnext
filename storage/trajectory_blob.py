@@ -15,7 +15,8 @@ disk, + 32-byte tail hash):
       trajectory_id  32s  SHA-256(raw uncompressed payload bytes)
       dimensions     H    256
       steps          H    128
-      dtype          B    0x02 (float32)
+      dtype          B    0x02 (float32) or 0x03 (int64, HEKBV3-BUILD002, disclosed:
+                            already-quantized BoardRecord cell values, element size 8B)
       endianness     B    0x01 (little-endian)
       created_at     Q    unix ms
       reserved       74s  zero padding
@@ -84,7 +85,15 @@ except ImportError:
 MAGIC = b"TRJ_V2"
 FORMAT_VERSION = 0x0002
 DTYPE_FLOAT32 = 0x02
+# [HEKBV3-BUILD002, disclosed]: new dtype code for storing already-quantized BoardRecord
+# cell values (nvs_edge/record.py's fixed-point int64 grid, step 2^QUANT_STEP_LOG2) without
+# dequantizing first -- ingestion keeps the Edge's own int64 values byte-for-byte; the index
+# build step is the one place that calls dequantize(). Element size is 8 bytes (int64), vs
+# 4 for float32 -- `_ELEMENT_FORMAT`/`_ELEMENT_SIZE` below branch on this field.
+DTYPE_INT64 = 0x03
 ENDIANNESS_LITTLE = 0x01
+_ELEMENT_FORMAT = {DTYPE_FLOAT32: "f", DTYPE_INT64: "q"}
+_ELEMENT_SIZE = {DTYPE_FLOAT32: 4, DTYPE_INT64: 8}
 DIMENSIONS = 256          # default/legacy: every MAC001/002/004 dataset inspected is 256-dim.
                           # [HEKBV3-BUILD001, disclosed]: the on-disk header already carries
                           # `dimensions` as a variable uint16 field (not a fixed magic constant),
@@ -136,10 +145,9 @@ class TrajectoryBlobHeader:
         return self.trajectory_id.hex()
 
 
-def _flatten_to_float32_bytes(points: list[list[float]], dimensions: int) -> tuple[bytes, int]:
-    """points: steps x dimensions (row-major), any numeric type -> (raw
-    little-endian float32 bytes, steps). `steps` is whatever len(points) is
-    -- not assumed to be 128 (see module docstring)."""
+def _flatten(points: list[list[float]] | list[list[int]], dimensions: int, dtype: int) -> tuple[bytes, int]:
+    """points: steps x dimensions (row-major) -> (raw little-endian bytes, steps).
+    `steps` is whatever len(points) is -- not assumed to be 128 (see module docstring)."""
     steps = len(points)
     if steps == 0:
         raise TrajectoryBlobError("trajectory has zero steps")
@@ -148,25 +156,32 @@ def _flatten_to_float32_bytes(points: list[list[float]], dimensions: int) -> tup
         if len(row) != dimensions:
             raise TrajectoryBlobError(f"expected {dimensions} dims per step, got {len(row)}")
         flat.extend(row)
-    return struct.pack(f"<{steps * dimensions}f", *flat), steps
+    fmt = _ELEMENT_FORMAT[dtype]
+    return struct.pack(f"<{steps * dimensions}{fmt}", *flat), steps
 
 
-def _unflatten_from_float32_bytes(raw: bytes, steps: int, dimensions: int) -> list[list[float]]:
+def _unflatten(raw: bytes, steps: int, dimensions: int, dtype: int) -> list[list[float]]:
     element_count = steps * dimensions
-    flat = struct.unpack(f"<{element_count}f", raw)
+    fmt = _ELEMENT_FORMAT[dtype]
+    flat = struct.unpack(f"<{element_count}{fmt}", raw)
     return [list(flat[i * dimensions:(i + 1) * dimensions]) for i in range(steps)]
 
 
 def encode_trajectory_blob(
     points: list[list[float]], created_at_ms: int | None = None, dimensions: int = DIMENSIONS,
+    dtype: int = DTYPE_FLOAT32,
 ) -> tuple[bytes, TrajectoryBlobHeader]:
     """points: N x `dimensions` real trajectory -> (file_bytes, header). Defaults to 256-D
-    (legacy MAC00x callers); pass `dimensions=64` for NVS Trajectory positions, etc. --
-    see the generalization note above `DIMENSIONS`. trajectory_id is derived from the raw
-    float32 payload (post-cast, since that IS what's persisted) -- not from the caller's
+    float32 (legacy MAC00x callers); pass `dimensions=64` for NVS Trajectory positions, etc.
+    -- see the generalization note above `DIMENSIONS`. Pass `dtype=DTYPE_INT64` to persist
+    already-quantized int64 values (e.g. BoardRecord cells) byte-for-byte, with no cast.
+    trajectory_id is derived from the raw on-disk-dtype payload bytes (post-cast for
+    float32, as-is for int64, since that IS what's persisted) -- not from the caller's
     original float64 values, matching the spec's own formula 'SHA256(Raw Payload Bytes)'."""
-    raw_payload, steps = _flatten_to_float32_bytes(points, dimensions)
-    expected_size = steps * dimensions * 4
+    if dtype not in _ELEMENT_FORMAT:
+        raise TrajectoryBlobError(f"unsupported dtype: {dtype}")
+    raw_payload, steps = _flatten(points, dimensions, dtype)
+    expected_size = steps * dimensions * _ELEMENT_SIZE[dtype]
     if len(raw_payload) != expected_size:
         raise TrajectoryBlobError(f"internal error: payload size {len(raw_payload)} != {expected_size}")
     if steps > 0xFFFF:
@@ -180,6 +195,7 @@ def encode_trajectory_blob(
         dimensions=dimensions,
         steps=steps,
         created_at_ms=created_at_ms if created_at_ms is not None else int(time.time() * 1000),
+        dtype=dtype,
     )
     header_bytes = _HEADER_STRUCT.pack(
         MAGIC, header.format_version, header.trajectory_id,
@@ -210,13 +226,13 @@ def decode_trajectory_blob(file_bytes: bytes) -> tuple[list[list[float]], Trajec
         raise TrajectoryBlobError(f"bad magic bytes: {magic!r}")
     if format_version != FORMAT_VERSION:
         raise TrajectoryBlobError(f"unsupported format_version: {format_version}")
-    if dtype != DTYPE_FLOAT32 or endianness != ENDIANNESS_LITTLE:
+    if dtype not in _ELEMENT_FORMAT or endianness != ENDIANNESS_LITTLE:
         raise TrajectoryBlobError(f"unsupported dtype/endianness: {dtype}/{endianness}")
     # dimensions is read from the header's own variable field, not asserted against a global
     # (see the generalization note above `DIMENSIONS`) -- any dimensionality this format's
     # uint16 field can hold decodes correctly.
 
-    expected_size = dimensions * steps * 4
+    expected_size = dimensions * steps * _ELEMENT_SIZE[dtype]
     raw_payload = zstd.decompress(compressed_payload)
     if len(raw_payload) != expected_size:
         raise TrajectoryBlobError(f"decompressed payload size {len(raw_payload)} != expected {expected_size} (steps={steps} from header)")
@@ -234,7 +250,7 @@ def decode_trajectory_blob(file_bytes: bytes) -> tuple[list[list[float]], Trajec
         created_at_ms=created_at_ms, format_version=format_version,
         dtype=dtype, endianness=endianness,
     )
-    return _unflatten_from_float32_bytes(raw_payload, steps, dimensions), header
+    return _unflatten(raw_payload, steps, dimensions, dtype), header
 
 
 def trajectory_path(trajectories_root: Path, trajectory_id_hex: str) -> Path:
