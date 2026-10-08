@@ -14,19 +14,27 @@ Input layout (per the Mac-side task's own §2/§3, plus `model_ref`/`layer` adde
     one JSON object per line, each BoardRecord.to_wire() (nvs_edge/record.py), in token
     order, over the 32 non-excluded ports (CORE_IDS).
 
-[HEKBV3-BUILD002, 2026-10-08 follow-up, disclosed]: `model_ref`/`layer` are now read FROM
-manifest.json (no longer CLI flags). `model_ref` is REQUIRED to be present; if missing, this
-script substitutes the literal "不明" and reports it (does not stop) -- per the explicit
-instruction, since the identifier lives in the *source* data (MSD0001 meta.json / CDM-DATA001
-selection_manifest.json), not something this script can derive on its own. Confirmed on this
-VM across 3 sessions' own meta.json + CDM-DATA001/selection_manifest.json (TRJ003's own
-manifest.json -- /media/psf/HEKBv3/trj003_48/manifest.json -- has layer_number=32,
-layer_index=7, consistent with the "32、添字7" given directly):
+[HEKBV3-BUILD002, 2026-10-08 follow-up, disclosed]: `model_ref`/`layer` are read FROM
+manifest.json when present (no longer CLI flags). `model_ref` is REQUIRED to be present; if
+missing, this script substitutes the literal "不明" and reports it (does not stop) -- per the
+explicit instruction, since the identifier lives in the *source* data (MSD0001 meta.json /
+CDM-DATA001 selection_manifest.json), not something this script can derive on its own.
+
+[HEKBV3-BUILD002 続き, 2026-10-08, disclosed]: the real Mac-produced manifest.json files
+(sessions/, validation48/) have NEITHER `layer` NOR `model_ref`. Per the explicit instruction
+("manifest を変更せず...ingest_context.json を新設"), manifest.json is never edited to add
+them; instead this script also looks for an optional sibling file,
+<manifest's own directory>/ingest_context.json, and uses its "layer"/"model_ref" fields when
+the manifest itself lacks them. `layer` is still hard-required overall (manifest OR context;
+raises if neither has it) -- its value is well-established (32, layer_index 7: confirmed from
+/media/psf/HEKBv3/trj003_48/manifest.json's own layer_number/layer_index fields). `model_ref`
+falls back further to "不明"+report only if BOTH manifest and ingest_context.json lack it.
+Confirmed on this VM (see /media/psf/HEKBv3/exp_hekbv3_boardrecords/ingest_context.json for
+the committed values and provenance):
   model_id = "meta-llama/Llama-3.1-8B-Instruct", revision = "0e9e39f249a16976918f6564b8830bc894c89659"
-(source: /media/psf/EXP-MSD0001 v1.1/sessions/*/meta.json "model" field, and
-/media/psf/sensos-experiments/CDM-DATA001/selection_manifest.json "model" field). `layer` is
-still required with no fallback (its value, 32, is well-established by the same investigation,
-unlike model_ref which is an opaque free-text identifier this script cannot validate).
+(source: /media/psf/EXP-MSD0001 v1.1/sessions/*/meta.json "model" field, cross-checked across
+3 sessions, identical; corroborated by
+/media/psf/sensos-experiments/CDM-DATA001/selection_manifest.json "model" field).
 
 [HEKBV3-BUILD002, disclosed design]: runs the real store_service ASGI app through
 starlette's TestClient (same mechanism as tests/test_v3_trajectory.py), pointed at
@@ -62,12 +70,26 @@ class IngestError(RuntimeError):
 MODEL_REF_UNKNOWN = "不明"
 
 
+def _load_ingest_context(manifest_path: Path) -> dict:
+    """Optional context file supplying layer/model_ref without editing manifest.json (see
+    module docstring's 2026-10-08 続き note). The task places this one level above the
+    manifest (.../exp_hekbv3_boardrecords/ingest_context.json, shared by both sessions/ and
+    validation48/ manifests), so this checks the manifest's own directory first, then its
+    parent. Returns {} when neither has the file."""
+    for candidate in (manifest_path.parent / "ingest_context.json",
+                      manifest_path.parent.parent / "ingest_context.json"):
+        if candidate.is_file():
+            return json.loads(candidate.read_text())
+    return {}
+
+
 def _load_manifest(manifest_path: Path) -> tuple[dict, bool]:
-    """Returns (manifest, model_ref_was_missing). `layer` has no fallback: it is well
-    established (32, layer_index 7 -- see module docstring) and is required to be present.
-    `model_ref` falls back to MODEL_REF_UNKNOWN (reported, not a stop) when absent."""
+    """Returns (manifest, model_ref_was_missing). `layer` is required overall (from manifest
+    itself, or failing that from the sibling ingest_context.json -- see _load_ingest_context);
+    raises if neither has it. `model_ref` falls back the same way, then to MODEL_REF_UNKNOWN
+    (reported, not a stop) if still absent."""
     manifest = json.loads(manifest_path.read_text())
-    required = ("sessions", "board_format", "quant_step_log2", "anchor_policy_sha256", "layer")
+    required = ("sessions", "board_format", "quant_step_log2", "anchor_policy_sha256")
     missing = [k for k in required if k not in manifest]
     if missing:
         raise IngestError(f"manifest.json missing required field(s): {missing}")
@@ -77,9 +99,24 @@ def _load_manifest(manifest_path: Path) -> tuple[dict, bool]:
         missing_s = [k for k in ("session_id", "category", "group", "split", "n_records", "file") if k not in s]
         if missing_s:
             raise IngestError(f"manifest.json sessions[{i}] missing field(s): {missing_s}")
+
+    context = _load_ingest_context(manifest_path)
+    manifest = dict(manifest)
+    if "layer" not in manifest:
+        if "layer" not in context:
+            raise IngestError(
+                "manifest.json missing required field(s): ['layer'] "
+                "(no ingest_context.json sibling file supplying it either)"
+            )
+        manifest["layer"] = context["layer"]
+
     model_ref_was_missing = not manifest.get("model_ref")
     if model_ref_was_missing:
-        manifest = {**manifest, "model_ref": MODEL_REF_UNKNOWN}
+        if context.get("model_ref"):
+            manifest["model_ref"] = context["model_ref"]
+            model_ref_was_missing = False
+        else:
+            manifest["model_ref"] = MODEL_REF_UNKNOWN
     return manifest, model_ref_was_missing
 
 

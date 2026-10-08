@@ -111,6 +111,28 @@ def test_ingest_missing_model_ref_falls_back_and_reports(two_sessions, tmp_path,
     assert ib.MODEL_REF_UNKNOWN in capsys.readouterr().out
 
 
+def test_ingest_reads_ingest_context_json_for_missing_layer_and_model_ref(two_sessions, tmp_path):
+    """HEKBV3-BUILD002 続き §1: real Mac manifests have neither 'layer' nor 'model_ref'; a
+    sibling ingest_context.json (checked in the manifest's own dir, then its parent -- the
+    task places the real one one level above sessions/manifest.json) supplies both without
+    editing manifest.json."""
+    manifest_path, shards_root = two_sessions
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["layer"]
+    del manifest["model_ref"]
+    manifest_path.write_text(json.dumps(manifest))
+    (shards_root / "ingest_context.json").write_text(json.dumps({
+        "layer": 32, "model_ref": "meta-llama/Llama-3.1-8B-Instruct",
+    }))
+
+    import ingest_boardrecords as ib
+
+    result = ib.run_ingest(manifest_path=manifest_path, shards_root=shards_root, data_dir=tmp_path / "data")
+    assert result["layer"] == 32
+    assert result["model_ref"] == "meta-llama/Llama-3.1-8B-Instruct"
+    assert result["model_ref_was_missing"] is False
+
+
 def test_ingest_requires_layer(two_sessions, tmp_path):
     manifest_path, shards_root = two_sessions
     manifest = json.loads(manifest_path.read_text())

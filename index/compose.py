@@ -123,19 +123,37 @@ def compose(
     laplace_alpha: float | None = None,
     posterior_mode: str = "alpha_over_k",
     skip_r1: bool = False,
+    library_categories: list[str] | None = None,
 ) -> ComposeResult:
+    """`library_categories` [perf, disclosed, optional]: the R3 step below needs
+    sorted(set(e["category"] for e in kept_entries)) -- identical on every call that shares
+    the same kept_entries (e.g. many queries composed against the same sampled library).
+    Recomputing it from scratch is an O(len(kept_entries)) pure-Python loop per call; a
+    caller that already knows this set (because it built kept_entries itself) can pass it
+    here to skip that rebuild. Default None preserves the exact prior behaviour for every
+    existing caller."""
     exclude_groups = exclude_groups or set()
     exclude_object_ids = exclude_object_ids or set()
 
-    keep_mask = np.array([
-        (e["group"] not in exclude_groups) and (e["object_id"] not in exclude_object_ids)
-        for e in entries
-    ])
-    if not keep_mask.any():
-        raise ComposeError("every library entry was excluded; nothing to compose against")
+    if not exclude_groups and not exclude_object_ids:
+        # [perf, disclosed]: nothing to exclude, so the mask would be all-True anyway --
+        # skip the O(len(entries)) Python-level membership loop below. Same kept_keys/
+        # kept_entries as the general path would produce (identity, not a copy); no
+        # numerical output changes for any caller.
+        if not entries:
+            raise ComposeError("every library entry was excluded; nothing to compose against")
+        kept_keys = keys
+        kept_entries = entries
+    else:
+        keep_mask = np.array([
+            (e["group"] not in exclude_groups) and (e["object_id"] not in exclude_object_ids)
+            for e in entries
+        ])
+        if not keep_mask.any():
+            raise ComposeError("every library entry was excluded; nothing to compose against")
 
-    kept_keys = keys[keep_mask]
-    kept_entries = [e for e, m in zip(entries, keep_mask) if m]
+        kept_keys = keys[keep_mask]
+        kept_entries = [e for e, m in zip(entries, keep_mask) if m]
 
     sq_dist = np.sum((kept_keys - query_standardized[None, :]) ** 2, axis=1)
     logits = -sq_dist / temperature
@@ -195,7 +213,8 @@ def compose(
     # that happen to appear in top_m; a category entirely absent from top_m still gets the
     # same alpha, rather than falling through to an external epsilon floor (the previous
     # build's behaviour, now corrected). alpha defaults to 1/K, overridable by the caller.
-    all_library_categories = sorted(set(e["category"] for e in kept_entries))
+    all_library_categories = (library_categories if library_categories is not None
+                               else sorted(set(e["category"] for e in kept_entries)))
     k_cat = max(len(all_library_categories), 1)
     alpha = laplace_alpha if laplace_alpha is not None else 1.0 / k_cat
 

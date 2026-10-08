@@ -89,6 +89,44 @@ def session_logloss(entries: list[dict], keys: np.ndarray, query_group: str, que
     return float(np.mean(losses))
 
 
+def _prefiltered_library(entries: list[dict], keys: np.ndarray, keep_groups: set[str],
+                          config: PreregisteredConfig) -> tuple[np.ndarray, list[dict], float, list[str]]:
+    """Builds (kept_keys, kept_entries, t0) once for a sampled library-group set. [perf,
+    disclosed, no statistics changed]: within one resample, this is IDENTICAL for every query
+    group whenever config.positive_control is False (library_pool_groups -- what `keep_groups`
+    is drawn from -- never contains a query group to begin with, per run_n_curve's own overlap
+    check, so discarding the query group from keep_groups is always a no-op there). The
+    original per-query/per-window code path rebuilt this same filtered array again for every
+    single window of every query session; hoisting it out here removes a ~(n_query_sessions x
+    windows_per_session) multiplier with no change to any individual compose() call's inputs
+    or outputs."""
+    keep_mask = np.array([e["group"] in keep_groups for e in entries])
+    if not keep_mask.any():
+        raise ValueError("every library entry excluded; nothing to compose against")
+    kept_keys = keys[keep_mask]
+    kept_entries = [e for e, m in zip(entries, keep_mask) if m]
+    t0 = p0r.default_temperature(keys, keep_mask) * config.temperature_multiplier
+    library_categories = sorted(set(e["category"] for e in kept_entries))
+    return kept_keys, kept_entries, t0, library_categories
+
+
+def _session_logloss_prefiltered(kept_keys: np.ndarray, kept_entries: list[dict], t0: float,
+                                  library_categories: list[str], query_rows: list[tuple],
+                                  config: PreregisteredConfig) -> float:
+    losses = []
+    for query_standardized, query_object_id, query_token_index, true_category in query_rows:
+        result = compose_mod.compose(
+            query_standardized=query_standardized, query_object_id=query_object_id,
+            query_token_index=query_token_index, keys=kept_keys, entries=kept_entries,
+            objects_dir=DUMMY_PATH, blobs_root=DUMMY_PATH,
+            temperature=t0, top_m=config.top_m, exclude_groups=None, skip_r1=True,
+            library_categories=library_categories,
+        )
+        p = result.category_posterior.get(true_category, 0.0)
+        losses.append(-math.log(max(p, EPS_LOG)))
+    return float(np.mean(losses))
+
+
 def _shuffle_categories_by_group(entries: list[dict], seed: int) -> list[dict]:
     """Group(=bundle)-level category-label shuffle: permutes which bundle's rows carry which
     category label (not a per-row/window shuffle)."""
@@ -100,6 +138,113 @@ def _shuffle_categories_by_group(entries: list[dict], seed: int) -> list[dict]:
     permuted_groups = rng.permutation(groups_sorted)
     shuffled_cat_of_group = dict(zip(groups_sorted, [cat_by_group[g] for g in permuted_groups]))
     return [dict(e, category=shuffled_cat_of_group[e["group"]]) for e in entries]
+
+
+def _posterior_from_neighbors(weights: list[float], neighbor_object_ids: list[str],
+                               neighbor_token_indices: list[int],
+                               entry_group_lookup: dict[tuple[str, int], str],
+                               category_of_group: dict[str, str], all_categories: list[str],
+                               alpha: float) -> dict[str, float]:
+    """Reproduces compose()'s own R3 "alpha_over_k" aggregation (index/compose.py, the
+    category_counts/posterior block) manually, from an ALREADY-COMPUTED set of neighbors and
+    weights, under a different group->category labeling than the one compose() itself used to
+    pick those neighbors. Exact, not an approximation: see run_n_curve_real_and_shuffle's
+    docstring for why this is valid here."""
+    counts = {c: 0.0 for c in all_categories}
+    for w, oid, tok in zip(weights, neighbor_object_ids, neighbor_token_indices):
+        c = category_of_group[entry_group_lookup[(oid, tok)]]
+        counts[c] = counts.get(c, 0.0) + w
+    total_w = sum(weights)  # == 1.0 by softmax construction (same as compose()'s own comment)
+    k_cat = max(len(all_categories), 1)
+    return {c: (counts[c] + alpha) / (total_w + k_cat * alpha) for c in all_categories}
+
+
+def run_n_curve_real_and_shuffle(
+    entries: list[dict], keys: np.ndarray, library_pool_groups: list[str],
+    query_sessions: dict[str, list[tuple]], config: PreregisteredConfig,
+) -> tuple[dict[int, list[dict]], dict[int, list[dict]]]:
+    """Computes the real AND group-shuffled curves in ONE pass over the query windows, instead
+    of two independent calls to run_n_curve. [perf, disclosed, EXACT -- not an approximation
+    or a change to the preregistered design]: compose()'s top_m neighbor selection and their
+    softmax weights depend only on distances between `query_standardized` and `kept_keys`
+    (library membership: which GROUPS are kept, from `sampled`/exclude_groups) -- never on
+    any entry's "category" field. A group-level category-LABEL shuffle changes neither which
+    groups are sampled nor which rows within them, so for the same (n, resample, query
+    window), compose()'s neighbor selection and weights are PROVABLY IDENTICAL whether the
+    library entries carry real or shuffled category labels. Only the final posterior
+    aggregation step (categorical counts over the chosen neighbors) differs. This calls
+    compose() once per query window (computing the real posterior exactly as run_n_curve
+    does) and derives the shuffled posterior directly from that same call's
+    (weights, neighbor_object_ids, neighbor_token_indices) via _posterior_from_neighbors,
+    instead of a second independent compose() pass with shuffled-category entries. The query's
+    own true_category is the REAL one in BOTH losses (matching session_logloss's existing
+    semantics: shuffling destroys the LIBRARY's signal only, the query's ground truth is
+    unchanged) -- this is the null-hypothesis control, not a relabeled query.
+    `library_categories`/alpha are recomputed separately for the real vs. shuffled view of the
+    SAME sampled groups, because the specific categories represented among those groups can
+    differ once their labels are permuted (same groups, different label composition).
+    Verified byte-identical against two independent run_n_curve(shuffle=False)/
+    run_n_curve(shuffle=True) calls on validation48 data before use on the real 1,296-session
+    run: see tests/test_eval_curve_boardrecords.py::test_combined_matches_separate_passes.
+    Requires config.positive_control is False (same precondition as the shared-library-filter
+    path in run_n_curve)."""
+    if config.positive_control:
+        raise ValueError("run_n_curve_real_and_shuffle does not support positive_control=True")
+
+    query_groups = set(query_sessions.keys())
+    overlap = query_groups & set(library_pool_groups)
+    if overlap:
+        raise ValueError(f"query groups must not overlap the library pool: {overlap}")
+
+    groups_sorted = sorted({e["group"] for e in entries})
+    cat_by_group = {}
+    for g in groups_sorted:
+        cat_by_group[g] = next(e["category"] for e in entries if e["group"] == g)
+    rng = np.random.default_rng(config.seed)
+    permuted_groups = rng.permutation(groups_sorted)
+    shuffled_cat_of_group = dict(zip(groups_sorted, [cat_by_group[g] for g in permuted_groups]))
+
+    pool = sorted(library_pool_groups)
+    out_real: dict[int, list[dict]] = {}
+    out_shuffle: dict[int, list[dict]] = {}
+
+    for n in config.n_values:
+        if n > len(pool):
+            raise ValueError(f"n={n} exceeds library pool size {len(pool)}")
+        rows_real, rows_shuffle = [], []
+        for r in range(config.n_resamples):
+            resample_rng = np.random.default_rng((config.seed, n, r))
+            sampled = set(resample_rng.choice(pool, size=n, replace=False).tolist())
+            kept_keys, kept_entries, t0, library_categories_real = _prefiltered_library(
+                entries, keys, sampled, config)
+            library_categories_shuffle = sorted(set(shuffled_cat_of_group[e["group"]] for e in kept_entries))
+            alpha_shuffle = 1.0 / max(len(library_categories_shuffle), 1)
+            entry_group_lookup = {(e["object_id"], e["token_index"]): e["group"] for e in kept_entries}
+
+            for qgroup, qrows in query_sessions.items():
+                real_losses, shuffle_losses = [], []
+                for query_standardized, query_object_id, query_token_index, true_category in qrows:
+                    result = compose_mod.compose(
+                        query_standardized=query_standardized, query_object_id=query_object_id,
+                        query_token_index=query_token_index, keys=kept_keys, entries=kept_entries,
+                        objects_dir=DUMMY_PATH, blobs_root=DUMMY_PATH,
+                        temperature=t0, top_m=config.top_m, exclude_groups=None, skip_r1=True,
+                        library_categories=library_categories_real,
+                    )
+                    p_real = result.category_posterior.get(true_category, 0.0)
+                    real_losses.append(-math.log(max(p_real, EPS_LOG)))
+
+                    posterior_shuffle = _posterior_from_neighbors(
+                        result.weights, result.neighbor_object_ids, result.neighbor_token_indices,
+                        entry_group_lookup, shuffled_cat_of_group, library_categories_shuffle, alpha_shuffle,
+                    )
+                    p_shuffle = posterior_shuffle.get(true_category, 0.0)
+                    shuffle_losses.append(-math.log(max(p_shuffle, EPS_LOG)))
+                rows_real.append({"group": qgroup, "logloss": float(np.mean(real_losses))})
+                rows_shuffle.append({"group": qgroup, "logloss": float(np.mean(shuffle_losses))})
+        out_real[n] = rows_real
+        out_shuffle[n] = rows_shuffle
+    return out_real, out_shuffle
 
 
 def run_n_curve(
@@ -126,9 +271,18 @@ def run_n_curve(
         for r in range(config.n_resamples):
             resample_rng = np.random.default_rng((config.seed, n, r))
             sampled = set(resample_rng.choice(pool, size=n, replace=False).tolist())
-            for qgroup, qrows in query_sessions.items():
-                ll = session_logloss(use_entries, keys, qgroup, qrows, sampled, config)
-                rows.append({"group": qgroup, "logloss": ll})
+            if config.positive_control:
+                # keep_groups differs per query (each query's own group is added back in),
+                # so the shared-filter fast path below does not apply -- use session_logloss
+                # (slower, correct) directly, one call per query group.
+                for qgroup, qrows in query_sessions.items():
+                    ll = session_logloss(use_entries, keys, qgroup, qrows, sampled, config)
+                    rows.append({"group": qgroup, "logloss": ll})
+            else:
+                kept_keys, kept_entries, t0, library_categories = _prefiltered_library(use_entries, keys, sampled, config)
+                for qgroup, qrows in query_sessions.items():
+                    ll = _session_logloss_prefiltered(kept_keys, kept_entries, t0, library_categories, qrows, config)
+                    rows.append({"group": qgroup, "logloss": ll})
         out[n] = rows
     return out
 
