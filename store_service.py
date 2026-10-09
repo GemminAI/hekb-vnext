@@ -1131,9 +1131,14 @@ def _require_hekbv3_trajectory_ext(payload: ExperiencePayload) -> dict[str, Any]
     # position series) have no position to carry. `ports` stays required: it is the only
     # thing build_index() reads (see index/experience_index.py), so dropping it would make
     # the index unrebuildable from objects+blobs alone.
-    for key in ("trajectory", "ports"):
+    # [HEKBV3-BUILD004, disclosed]: `causal_log` (D-03/D-24's full 38-port causal log --
+    # per-token P01-P38 values + cycle_raw judgment/reason, distinct from the `ports` board
+    # blob which only carries the already-quantized 32-cell board values) is likewise
+    # OPTIONAL at this layer (older ingests have none), but is validated the same way as
+    # `trajectory` when present: its blob must already exist.
+    for key in ("trajectory", "ports", "causal_log"):
         ref = ext.get(key)
-        if ref is None and key == "trajectory":
+        if ref is None and key in ("trajectory", "causal_log"):
             continue
         if not isinstance(ref, dict) or "blob_sha256" not in ref:
             raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.{key}.blob_sha256 is required")

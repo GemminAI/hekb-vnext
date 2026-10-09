@@ -128,6 +128,62 @@ def _read_shard(shard_path: Path) -> list[dict]:
     return [json.loads(line) for line in lines]
 
 
+def _find_raw_log_file(raw_logs_root: Path, session_id: str) -> Path:
+    """[HEKBV3-BUILD004] Locates the raw per-token log for `session_id` under
+    `raw_logs_root` (the Mac-side TRJ003 replay output, e.g. .../trj003_48/results_vm).
+    Raw files are named `<prefix>_<NNN>_<session_id>.jsonl.gz` (msd_session_id is the
+    filename's own suffix, not a separate index) -- matched by glob, not by trusting any
+    pre-existing index file, so this is self-contained and verifiable from the raw files
+    alone. Exactly one match is required; zero or more than one is a stop condition (the
+    task's own "原因の箇所が1つに絞れない" rule applies equally to this join)."""
+    candidates = sorted((raw_logs_root / "sessions").glob(f"*_{session_id}.jsonl.gz"))
+    if len(candidates) == 0:
+        raise IngestError(f"session {session_id}: no raw log file found under {raw_logs_root / 'sessions'}")
+    if len(candidates) > 1:
+        raise IngestError(f"session {session_id}: ambiguous raw log match: {candidates}")
+    return candidates[0]
+
+
+def _read_raw_causal_log(raw_logs_root: Path, session_id: str, board_records: list[dict]) -> tuple[list[dict], str, str]:
+    """[HEKBV3-BUILD004] Reads the raw TRJ003 per-token log matching `session_id`, checks
+    it 1:1 against the already-validated BoardRecord shard (`board_records`: same
+    (token_index, seq) order -- this is the join key, verified rather than assumed), and
+    returns (per-token causal-log records ready for `encode_causal_log_blob`,
+    raw_file_relative_path, raw_file_sha256). Stops (raises) on any count or ordering
+    mismatch -- never silently drops or reorders tokens."""
+    raw_path = _find_raw_log_file(raw_logs_root, session_id)
+    raw_bytes = raw_path.read_bytes()
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    with gzip.open(raw_path, "rt", encoding="utf-8") as fh:
+        raw_lines = [line for line in fh.read().splitlines() if line]
+    if len(raw_lines) != len(board_records):
+        raise IngestError(
+            f"session {session_id}: raw log {raw_path} has {len(raw_lines)} records, "
+            f"BoardRecord shard has {len(board_records)}"
+        )
+    rel_path = str(raw_path.relative_to(raw_logs_root))
+    out: list[dict] = []
+    for line_number, (line, board_rec) in enumerate(zip(raw_lines, board_records), start=1):
+        raw_rec = json.loads(line)
+        if raw_rec.get("token_index") != board_rec["token_index"] or raw_rec.get("seq") != board_rec["seq"]:
+            raise IngestError(
+                f"session {session_id}: raw log line {line_number} "
+                f"(token_index={raw_rec.get('token_index')}, seq={raw_rec.get('seq')}) does not align "
+                f"with BoardRecord shard entry (token_index={board_rec['token_index']}, seq={board_rec['seq']})"
+            )
+        for field in ("ports", "cycle_raw", "trajectory_hash"):
+            if field not in raw_rec:
+                raise IngestError(f"session {session_id}: raw log line {line_number} missing {field!r}")
+        out.append({
+            "token_index": raw_rec["token_index"], "seq": raw_rec["seq"],
+            "trajectory_hash": raw_rec["trajectory_hash"], "ports": raw_rec["ports"],
+            "cycle_raw": raw_rec["cycle_raw"],
+            "source_file": {"path": rel_path, "sha256": raw_sha256},
+            "line_number": line_number,
+        })
+    return out, rel_path, raw_sha256
+
+
 def _session_ports_matrix(records: list[dict], session_id: str, expected_anchor_policy: str) -> tuple[list[list[int]], list[str]]:
     """Validates internal consistency of one session's BoardRecord lines and returns
     (rows: n_steps x n_ports int64 cell values, in token order; port_ids: the fixed cell
@@ -181,7 +237,15 @@ def _generate_dev_signer():
 def run_ingest(
     *, manifest_path: Path, shards_root: Path, data_dir: Path,
     only_session_ids: set[str] | None = None, progress_every: int = 50,
+    raw_logs_root: Path | None = None,
 ) -> dict:
+    """[HEKBV3-BUILD004] `raw_logs_root`, when given, points at the Mac-side TRJ003 replay
+    output (e.g. .../trj003_48/results_vm) that the BoardRecord shards under `shards_root`
+    were themselves derived from. When set, EVERY session in scope must have a matching
+    raw log (see `_find_raw_log_file`/`_read_raw_causal_log`) -- a missing or misaligned
+    raw log is a stop condition, same severity as the existing n_records/anchor_policy
+    checks, not a silently-skipped session. The resulting `ext.hekbv3.causal_log` blob is
+    what D-03/D-24 call for and `ports`/`cells` alone never carried (see module docstring)."""
     import os
 
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +260,7 @@ def run_ingest(
     from starlette.testclient import TestClient
 
     from storage.trajectory_blob import DTYPE_INT64, encode_trajectory_blob
+    from storage.causal_log_blob import encode_causal_log_blob
 
     manifest, model_ref_was_missing = _load_manifest(manifest_path)
     quant_step_log2 = manifest["quant_step_log2"]
@@ -250,20 +315,41 @@ def run_ingest(
         if blob_resp.status_code != 201:
             raise IngestError(f"session {session_id}: PUT /v3/blobs failed: {blob_resp.status_code} {blob_resp.text}")
 
+        ext_hekbv3 = {
+            "kind": "trajectory", "origin": "experience",
+            "space": {**space, "space_id": space_id},
+            "ports": {
+                "blob_sha256": blob_sha256, "n_steps": len(rows), "dim": len(port_ids),
+                "port_ids": port_ids, "quant_step_log2": quant_step_log2,
+            },
+            "labels": {"category": s["category"], "split": s["split"], "group": s["group"]},
+            "outcome": {"result": "n/a"},
+        }
+
+        # [HEKBV3-BUILD004] causal_log: D-03/D-24's full 38-port causal log, sourced from
+        # the raw TRJ003 per-token logs (NOT from `causal_log_ref`/`cells`, neither of
+        # which carries the actual content -- see module docstring and REPORT).
+        if raw_logs_root is not None:
+            causal_records, raw_rel_path, raw_sha256 = _read_raw_causal_log(raw_logs_root, session_id, records)
+            causal_bytes, causal_blob_sha256 = encode_causal_log_blob(causal_records)
+            causal_resp = client.put(f"/v3/blobs/{causal_blob_sha256}", content=causal_bytes,
+                                      headers={"Content-Type": "application/octet-stream"})
+            if causal_resp.status_code != 201:
+                raise IngestError(
+                    f"session {session_id}: PUT /v3/blobs (causal_log) failed: "
+                    f"{causal_resp.status_code} {causal_resp.text}"
+                )
+            ext_hekbv3["causal_log"] = {
+                "blob_sha256": causal_blob_sha256, "n_steps": len(causal_records),
+                "schema": "hekbv3.causal_log/1",
+                "source_file": {"path": raw_rel_path, "sha256": raw_sha256},
+            }
+
         payload = {
             "schema": "hekb.experience/2",
             "raw_input": f"boardrecord session={session_id}",
             "resolved_meaning": None, "action": None, "title": session_id, "tags": ["boardrecord"],
-            "ext": {"hekbv3": {
-                "kind": "trajectory", "origin": "experience",
-                "space": {**space, "space_id": space_id},
-                "ports": {
-                    "blob_sha256": blob_sha256, "n_steps": len(rows), "dim": len(port_ids),
-                    "port_ids": port_ids, "quant_step_log2": quant_step_log2,
-                },
-                "labels": {"category": s["category"], "split": s["split"], "group": s["group"]},
-                "outcome": {"result": "n/a"},
-            }},
+            "ext": {"hekbv3": ext_hekbv3},
         }
         sig = sign(payload, store_service.canonical_bytes)
         resp = client.post("/v3/trajectories", json={"payload": payload}, headers={"X-Audit-Signature": sig})
@@ -273,6 +359,7 @@ def run_ingest(
         results.append({
             "session_id": session_id, "object_id": body["object_id"],
             "n_records": len(rows), "category": s["category"], "group": s["group"], "split": s["split"],
+            "has_causal_log": raw_logs_root is not None,
         })
         if i % progress_every == 0 or i == len(sessions):
             print(f"[ingest_boardrecords] {i}/{len(sessions)} sessions ingested", flush=True)
@@ -280,7 +367,43 @@ def run_ingest(
     return {
         "space_id": space_id, "data_dir": str(data_dir), "n_sessions": len(results), "sessions": results,
         "model_ref": model_ref, "model_ref_was_missing": model_ref_was_missing, "layer": layer,
+        "nvs_kernel_commit": manifest.get("nvs_kernel_commit"),
+        "nvs_runtime_commit": manifest.get("nvs_runtime_commit"),
     }
+
+
+def _git_commit_hash() -> str | None:
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _write_provenance_manifest(data_dir: Path, *, result: dict, manifest_path: Path,
+                                raw_logs_root: Path | None) -> None:
+    """[HEKBV3-BUILD004] Records THIS ingest run's own argv and the upstream
+    nvs-kernel/nvs-runtime commits (read from the source manifest.json, never written back
+    into it -- D-18: 記録は書き換えない) into a NEW file under the output data dir. Never
+    touches the source manifest.json or any existing report."""
+    import datetime
+
+    out = {
+        "note": "HEKBV3-BUILD004: provenance for this ingest run (argv + upstream commits). "
+                 "Does not modify manifest.json (D-18).",
+        "argv": sys.argv,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source_manifest_path": str(manifest_path),
+        "source_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "raw_logs_root": str(raw_logs_root) if raw_logs_root is not None else None,
+        "nvs_kernel_commit": result.get("nvs_kernel_commit"),
+        "nvs_runtime_commit": result.get("nvs_runtime_commit"),
+        "hekb_vnext_v3_commit": _git_commit_hash(),
+        "space_id": result["space_id"], "n_sessions": result["n_sessions"],
+    }
+    (data_dir / "ingest_manifest.json").write_text(json.dumps(out, indent=2))
 
 
 def main() -> None:
@@ -291,6 +414,10 @@ def main() -> None:
     parser.add_argument("--data-dir", required=True, type=Path,
                          help="HEKB_DATA_DIR for this ingest (no default -- never points at production).")
     parser.add_argument("--only", nargs="*", default=None, help="Restrict to these session_ids (default: all in manifest).")
+    parser.add_argument("--raw-logs-root", type=Path, default=None,
+                         help="Mac-side TRJ003 replay output root (e.g. .../trj003_48/results_vm) to pull the "
+                              "full 38-port causal log from. When given, every session in scope must have a "
+                              "matching raw log (stop on mismatch) -- see module docstring.")
     args = parser.parse_args()
 
     shards_root = args.shards_root or args.manifest.resolve().parent
@@ -298,12 +425,14 @@ def main() -> None:
     try:
         result = run_ingest(
             manifest_path=args.manifest, shards_root=shards_root, data_dir=args.data_dir,
-            only_session_ids=only,
+            only_session_ids=only, raw_logs_root=args.raw_logs_root,
         )
     except IngestError as exc:
         print(f"[ingest_boardrecords] STOP: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
+    _write_provenance_manifest(args.data_dir, result=result, manifest_path=args.manifest,
+                                raw_logs_root=args.raw_logs_root)
     print(json.dumps({k: v for k, v in result.items() if k != "sessions"}, indent=1))
 
 
