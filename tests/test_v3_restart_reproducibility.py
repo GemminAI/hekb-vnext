@@ -63,7 +63,7 @@ def _start_service(data_dir: Path, app_support_dir: Path, index_dir: Path, pubke
         "PATH": "/usr/bin:/bin",
     }
     proc = subprocess.Popen(
-        [str(REPO_ROOT / ".venv" / "bin" / "python3"), "store_service.py",
+        [sys.executable, "store_service.py",
          "--host", "127.0.0.1", "--port", str(port), "--no-uds"],
         cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
