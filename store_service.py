@@ -120,6 +120,7 @@ from index import compose as compose_mod  # noqa: E402
 from index import experience_index  # noqa: E402
 from index.space_id import SpaceIdError, compute_space_id  # noqa: E402
 from storage import blobs as blob_store  # noqa: E402
+from storage import causal_log_blob  # noqa: E402
 
 API_VERSIONS = ["hekb.experience/1", "hekb.experience/2", "v3-trajectory-experience-channel"]
 
@@ -1127,18 +1128,13 @@ def _require_hekbv3_trajectory_ext(payload: ExperiencePayload) -> dict[str, Any]
                     f"the recomputed value {recomputed!r} for the given space fields",
         )
     # [HEKBV3-BUILD002, disclosed]: `trajectory` (the 64-D position blob, used only by R1)
-    # is now OPTIONAL -- BoardRecord-sourced sessions (nvs-runtime replay executor, no
+    # is OPTIONAL -- BoardRecord-sourced sessions (nvs-runtime replay executor, no
     # position series) have no position to carry. `ports` stays required: it is the only
     # thing build_index() reads (see index/experience_index.py), so dropping it would make
     # the index unrebuildable from objects+blobs alone.
-    # [HEKBV3-BUILD004, disclosed]: `causal_log` (D-03/D-24's full 38-port causal log --
-    # per-token P01-P38 values + cycle_raw judgment/reason, distinct from the `ports` board
-    # blob which only carries the already-quantized 32-cell board values) is likewise
-    # OPTIONAL at this layer (older ingests have none), but is validated the same way as
-    # `trajectory` when present: its blob must already exist.
-    for key in ("trajectory", "ports", "causal_log"):
+    for key in ("trajectory", "ports"):
         ref = ext.get(key)
-        if ref is None and key in ("trajectory", "causal_log"):
+        if ref is None and key == "trajectory":
             continue
         if not isinstance(ref, dict) or "blob_sha256" not in ref:
             raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.{key}.blob_sha256 is required")
@@ -1148,7 +1144,74 @@ def _require_hekbv3_trajectory_ext(payload: ExperiencePayload) -> dict[str, Any]
                 detail=f"payload.ext.hekbv3.{key}.blob_sha256 {ref['blob_sha256']!r} not found; "
                        f"PUT /v3/blobs/{{sha256}} before POST /v3/trajectories",
             )
+    _require_causal_log(ext)
     return ext
+
+
+#: D-03/D-24: the causal log's own "ports" field must carry every one of the 38 Core
+#: Ports' raw readings -- not whatever subset `ext.hekbv3.ports.port_ids` happens to
+#: list (that can legitimately be the 32-cell board's own excluded-6 subset; the causal
+#: log is the one place that is never true of).
+_ALL_38_PORT_IDS = tuple(f"P{n:02d}" for n in range(1, 39))
+
+
+def _require_causal_log(ext: dict[str, Any]) -> None:
+    """D-03/D-24 (feature/require-causal-log): a trajectory experience must carry its
+    causal log -- every one of the 38 Core Ports' raw reading and the raw cycle, for
+    every token -- unless the caller explicitly says it is omitting one on purpose
+    (`causal_log_omitted_reason`, a non-empty string recorded verbatim on the stored
+    experience, never silently). This is a deliberate tightening of the OPTIONAL rule
+    HEKBV3-BUILD004 shipped (older ingests had no causal log at all); callers that
+    legitimately have none -- e.g. `scripts/ingest_boardrecords.py` without
+    --raw-logs-root -- now have to say so."""
+    causal_log = ext.get("causal_log")
+    omitted_reason = ext.get("causal_log_omitted_reason")
+
+    if causal_log is None:
+        if not isinstance(omitted_reason, str) or not omitted_reason.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="payload.ext.hekbv3.causal_log is required (D-03/D-24); set "
+                       "payload.ext.hekbv3.causal_log_omitted_reason to a non-empty string "
+                       "to explicitly omit it instead",
+            )
+        return
+
+    if not isinstance(causal_log, dict) or "blob_sha256" not in causal_log:
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3.causal_log.blob_sha256 is required")
+    blob_sha256 = causal_log["blob_sha256"]
+    if not blob_store.has_blob(_blobs_dir(), blob_sha256):
+        raise HTTPException(
+            status_code=404,
+            detail=f"payload.ext.hekbv3.causal_log.blob_sha256 {blob_sha256!r} not found; "
+                   f"PUT /v3/blobs/{{sha256}} before POST /v3/trajectories",
+        )
+
+    data = blob_store.get_blob(_blobs_dir(), blob_sha256)
+    try:
+        records = causal_log_blob.decode_causal_log_blob(data)
+    except causal_log_blob.CausalLogBlobError as exc:
+        raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.causal_log blob is malformed: {exc}") from exc
+
+    declared_n_steps = causal_log.get("n_steps")
+    if declared_n_steps is not None and declared_n_steps != len(records):
+        raise HTTPException(
+            status_code=422,
+            detail=f"payload.ext.hekbv3.causal_log.n_steps={declared_n_steps} but the blob "
+                   f"has {len(records)} record(s)",
+        )
+    for i, record in enumerate(records):
+        if "cycle_raw" not in record or record["cycle_raw"] is None:
+            raise HTTPException(status_code=422, detail=f"causal_log record {i} is missing cycle_raw")
+        ports = record.get("ports")
+        if not isinstance(ports, dict):
+            raise HTTPException(status_code=422, detail=f"causal_log record {i} is missing ports")
+        missing_ports = [p for p in _ALL_38_PORT_IDS if p not in ports]
+        if missing_ports:
+            raise HTTPException(
+                status_code=422,
+                detail=f"causal_log record {i} is missing port(s): {missing_ports}",
+            )
 
 
 @app.post("/v3/trajectories", response_model=ExperienceOut, status_code=201)

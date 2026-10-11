@@ -344,6 +344,14 @@ def run_ingest(
                 "schema": "hekbv3.causal_log/1",
                 "source_file": {"path": raw_rel_path, "sha256": raw_sha256},
             }
+        else:
+            # feature/require-causal-log: the server now rejects a trajectory with no
+            # causal_log unless this is set -- true here, not a bypass: this ingest run
+            # was not given --raw-logs-root, so it genuinely has no raw per-token log to
+            # build one from (recorded on the stored experience, never silent).
+            ext_hekbv3["causal_log_omitted_reason"] = (
+                "ingested without --raw-logs-root; no raw per-token TRJ003 log was available"
+            )
 
         payload = {
             "schema": "hekb.experience/2",

@@ -143,6 +143,10 @@ def main() -> None:
                 "space": {**space, "space_id": space_id},
                 "trajectory": {"blob_sha256": pos_sha, "n_steps": int(positions.shape[0]), "dim": 64},
                 "ports": {"blob_sha256": ports_sha, "n_steps": int(ports.shape[0]), "dim": 38, "port_ids": list(ALL_38)},
+                # feature/require-causal-log: this TRJ003 run predates the causal_log
+                # feature entirely (v6.1.3, see compute_space's own note above) -- there
+                # is no raw per-token log to build one from, explicitly, not a bypass.
+                "causal_log_omitted_reason": "pre-causal_log TRJ003 run (NVS-Kernel v6.1.3)",
                 "labels": {"category": s["category"], "split": s["split"], "group": s["prompt_id"]},
                 "outcome": {"result": s["label"], "intended_label": s["intended_label"]},
             }},

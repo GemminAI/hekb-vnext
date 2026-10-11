@@ -188,8 +188,11 @@ def test_ingest_writes_provenance_manifest(two_sessions_with_raw_logs, tmp_path,
 
 
 def test_causal_log_validated_by_require_hekbv3_trajectory_ext(tmp_path, monkeypatch):
-    """store_service-level: causal_log is optional, but if present its blob must exist
-    (same contract as `trajectory`)."""
+    """store_service-level: a referenced causal_log's blob must exist (same contract as
+    `ports`/`trajectory`) -- this payload's `ports` blob doesn't exist either, so the
+    exact rejection reason isn't pinned down to causal_log specifically here; see
+    test_require_causal_log.py for causal_log's own dedicated (and, since
+    feature/require-causal-log, no-longer-optional-by-default) behavior."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setenv("HEKB_DATA_DIR", str(data_dir))

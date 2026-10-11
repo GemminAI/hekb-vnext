@@ -97,6 +97,30 @@ def _make_ports_rows(rng: np.random.Generator, n_steps: int) -> list[list[float]
     return rows
 
 
+def _make_causal_log_blob(base_url: str, token: str, rng: np.random.Generator, n_steps: int) -> tuple[str, int]:
+    """feature/require-causal-log: see test_v3_trajectory.py's own helper of the same
+    name for why this is independent of ports_rows's width. created_at carries no
+    wall-clock component here either (encode_causal_log_blob has no timestamp field at
+    all), so this stays reproducible across the test's two service runs (K8)."""
+    sys.path.insert(0, str(REPO_ROOT))
+    from storage.causal_log_blob import encode_causal_log_blob
+
+    records = [
+        {
+            "token_index": t, "seq": t, "trajectory_hash": "t" * 64,
+            "ports": dict(zip(ALL_38, rng.normal(size=38).tolist(), strict=True)),
+            "cycle_raw": {"step": t},
+            "source_file": {"path": "synthetic", "sha256": "s" * 64}, "line_number": t + 1,
+        }
+        for t in range(n_steps)
+    ]
+    data, sha256 = encode_causal_log_blob(records)
+    r = requests.put(f"{base_url}/v3/blobs/{sha256}", data=data,
+                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"})
+    assert r.status_code == 201, r.text
+    return sha256, n_steps
+
+
 def _post_trajectory(base_url: str, token: str, sign, *, seed: int, category: str, group: str, space_id: str) -> dict:
     rng = np.random.default_rng(seed)
     n_steps = 20
@@ -104,6 +128,7 @@ def _post_trajectory(base_url: str, token: str, sign, *, seed: int, category: st
     ports_rows = _make_ports_rows(rng, n_steps)
     pos_sha = _put_blob(base_url, token, positions, dim=64)
     ports_sha = _put_blob(base_url, token, ports_rows, dim=38)
+    causal_sha, causal_n_steps = _make_causal_log_blob(base_url, token, rng, n_steps)
     payload = {
         "schema": "hekb.experience/2", "raw_input": f"trajectory seed={seed}", "resolved_meaning": None,
         "action": None, "title": f"traj-{seed}", "tags": ["trj"],
@@ -112,6 +137,7 @@ def _post_trajectory(base_url: str, token: str, sign, *, seed: int, category: st
             "space": {**SPACE, "space_id": space_id},
             "trajectory": {"blob_sha256": pos_sha, "n_steps": n_steps, "dim": 64},
             "ports": {"blob_sha256": ports_sha, "n_steps": n_steps, "dim": 38, "port_ids": list(ALL_38)},
+            "causal_log": {"blob_sha256": causal_sha, "n_steps": causal_n_steps},
             "labels": {"category": category, "split": "dev", "group": group},
             "outcome": {"result": "n/a"},
         }},

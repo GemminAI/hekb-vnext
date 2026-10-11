@@ -78,6 +78,29 @@ def _make_ports_rows(rng: np.random.Generator, n_steps: int) -> list[list[float]
     return rows
 
 
+def _make_causal_log_blob(client: TestClient, rng: np.random.Generator, n_steps: int) -> tuple[str, int]:
+    """feature/require-causal-log: every trajectory these tests post now needs a
+    causal_log with all 38 Core Ports + cycle_raw per token -- independent of whatever
+    width `ports_rows` the test's own board-cells blob carries (that one can legitimately
+    be the 32-cell board subset; the causal log never is). Returns (blob_sha256,
+    n_steps)."""
+    from storage.causal_log_blob import encode_causal_log_blob
+
+    records = [
+        {
+            "token_index": t, "seq": t, "trajectory_hash": "t" * 64,
+            "ports": dict(zip(ALL_38, rng.normal(size=38).tolist(), strict=True)),
+            "cycle_raw": {"step": t},
+            "source_file": {"path": "synthetic", "sha256": "s" * 64}, "line_number": t + 1,
+        }
+        for t in range(n_steps)
+    ]
+    data, sha256 = encode_causal_log_blob(records)
+    resp = client.put(f"/v3/blobs/{sha256}", content=data, headers={"Content-Type": "application/octet-stream"})
+    assert resp.status_code == 201, resp.text
+    return sha256, n_steps
+
+
 def _post_trajectory(client: TestClient, *, seed: int, category: str, group: str, space_id: str | None = None, n_steps: int = 20):
     rng = np.random.default_rng(seed)
     positions = [list(v / np.linalg.norm(v)) for v in rng.normal(size=(n_steps, 64))]
@@ -85,6 +108,7 @@ def _post_trajectory(client: TestClient, *, seed: int, category: str, group: str
 
     pos_sha = _put_blob(client, positions, dim=64)
     ports_sha = _put_blob(client, ports_rows, dim=38)
+    causal_sha, causal_n_steps = _make_causal_log_blob(client, rng, n_steps)
 
     space_resp = client.post("/v3/space-id", json=SPACE)
     assert space_resp.status_code == 200, space_resp.text
@@ -99,6 +123,7 @@ def _post_trajectory(client: TestClient, *, seed: int, category: str, group: str
             "space": {**SPACE, "space_id": computed_space_id},
             "trajectory": {"blob_sha256": pos_sha, "n_steps": n_steps, "dim": 64},
             "ports": {"blob_sha256": ports_sha, "n_steps": n_steps, "dim": 38, "port_ids": list(ALL_38)},
+            "causal_log": {"blob_sha256": causal_sha, "n_steps": causal_n_steps},
             "labels": {"category": category, "split": "dev", "group": group},
             "outcome": {"result": "n/a"},
         }},
@@ -130,6 +155,7 @@ def _post_trajectory_no_position(client: TestClient, *, seed: int, category: str
     ports_sha = hashlib.sha256(file_bytes).hexdigest()
     resp = client.put(f"/v3/blobs/{ports_sha}", content=file_bytes, headers={"Content-Type": "application/octet-stream"})
     assert resp.status_code == 201, resp.text
+    causal_sha, causal_n_steps = _make_causal_log_blob(client, rng, n_steps)
 
     space_resp = client.post("/v3/space-id", json=SPACE)
     assert space_resp.status_code == 200, space_resp.text
@@ -144,6 +170,7 @@ def _post_trajectory_no_position(client: TestClient, *, seed: int, category: str
             "space": {**SPACE, "space_id": computed_space_id},
             "ports": {"blob_sha256": ports_sha, "n_steps": n_steps, "dim": 32,
                       "port_ids": list(CORE_32), "quant_step_log2": QUANT_STEP_LOG2},
+            "causal_log": {"blob_sha256": causal_sha, "n_steps": causal_n_steps},
             "labels": {"category": category, "split": "dev", "group": group},
             "outcome": {"result": "n/a"},
         }},
@@ -217,6 +244,7 @@ def test_k5_cross_space_compose_is_409(client: TestClient):
     ports_rows = _make_ports_rows(rng, 20)
     pos_sha = _put_blob(client, positions, dim=64)
     ports_sha = _put_blob(client, ports_rows, dim=38)
+    causal_sha, causal_n_steps = _make_causal_log_blob(client, rng, 20)
     space_id_b = client.post("/v3/space-id", json=other_space).json()["space_id"]
     payload = {
         "schema": "hekb.experience/2", "raw_input": "other-space", "resolved_meaning": None,
@@ -226,6 +254,7 @@ def test_k5_cross_space_compose_is_409(client: TestClient):
             "space": {**other_space, "space_id": space_id_b},
             "trajectory": {"blob_sha256": pos_sha, "n_steps": 20, "dim": 64},
             "ports": {"blob_sha256": ports_sha, "n_steps": 20, "dim": 38, "port_ids": list(ALL_38)},
+            "causal_log": {"blob_sha256": causal_sha, "n_steps": causal_n_steps},
             "labels": {"category": "catB", "split": "dev", "group": "gB"},
             "outcome": {"result": "n/a"},
         }},
