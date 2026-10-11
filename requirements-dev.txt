@@ -1,0 +1,12 @@
+-r requirements.txt
+
+# Test-only dependencies. Nothing in requirements.txt (the runtime
+# service's own deps) imports these -- only tests/ does. Versions are the
+# lower bound of what is currently working, verified against a fresh,
+# isolated venv on this Mac (not the Mac's globally-installed copies,
+# which were already present and masking this gap -- see the CI/VM
+# failure this file fixes: 10 passed / 13 failed / 6 collection errors,
+# all from pytest/httpx/requests never having been declared anywhere).
+pytest>=9.1.1
+httpx>=0.28.1
+requests>=2.34.2
