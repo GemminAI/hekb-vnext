@@ -6,7 +6,7 @@ signature check, idempotent-by-content object_id) -- never a bypass of that path
 Input layout (per the Mac-side task's own §2/§3, plus `model_ref`/`layer` added by the
 2026-10-08 follow-up instruction):
   <root>/manifest.json: {"sessions": [{"session_id","category","group","split","n_records",
-    "file"}, ...], "board_format", "quant_step_log2", "format_version", "projection_sha256",
+    "file"}, ...], "board_format", "quant_step_log2", "wiring_policy_sha256", "time_policy_sha256", "format_version", "projection_sha256",
     "w_sha256", "anchor_policy_sha256", "model_ref", "layer", ...commits/sha256s (read but
     not re-verified here beyond the per-session n_records/anchor_policy_sha256 checks
     below)}.
@@ -89,7 +89,10 @@ def _load_manifest(manifest_path: Path) -> tuple[dict, bool]:
     raises if neither has it. `model_ref` falls back the same way, then to MODEL_REF_UNKNOWN
     (reported, not a stop) if still absent."""
     manifest = json.loads(manifest_path.read_text())
-    required = ("sessions", "board_format", "quant_step_log2", "anchor_policy_sha256")
+    required = (
+        "sessions", "board_format", "quant_step_log2", "anchor_policy_sha256",
+        "wiring_policy_sha256", "time_policy_sha256",
+    )
     missing = [k for k in required if k not in manifest]
     if missing:
         raise IngestError(f"manifest.json missing required field(s): {missing}")
@@ -276,6 +279,8 @@ def run_ingest(
         "projection_sha256": manifest.get("projection_sha256", "0" * 64),
         "w_sha256": manifest.get("w_sha256", "0" * 64),
         "anchor_policy_sha256": manifest_anchor_policy,
+        "wiring_policy_sha256": manifest["wiring_policy_sha256"],
+        "time_policy_sha256": manifest["time_policy_sha256"],
         "board_format": board_format, "quant_step_log2": quant_step_log2,
     }
 

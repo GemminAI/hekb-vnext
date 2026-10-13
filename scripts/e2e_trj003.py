@@ -86,6 +86,9 @@ def compute_space(manifest: dict) -> dict:
         # session's own per-run summary (INDEX.jsonl) shows "anchor_info": null, confirming no
         # anchor policy was in effect -- "none" is used as the fixed sentinel for this space.
         "anchor_policy_sha256": "none",
+        # same disclosure for the v7 rules: v6.1.3 predates both (fixed literals, fixed dt)
+        "wiring_policy_sha256": "legacy-fixed-v1",
+        "time_policy_sha256": "fixed-dt-v1",
         "board_format": "36cell/1",
         "quant_step_log2": -30,
     }

@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ALL_38 = tuple(f"P{n:02d}" for n in range(1, 39))
 SPACE = {
     "model_ref": "toy-model", "layer": 1, "projection_sha256": "p" * 64, "w_sha256": "w" * 64,
-    "anchor_policy_sha256": "a" * 64, "board_format": "36cell/1", "quant_step_log2": -30,
+    "anchor_policy_sha256": "a" * 64, "wiring_policy_sha256": "b" * 64, "time_policy_sha256": "c" * 64,
+    "board_format": "36cell/1", "quant_step_log2": -30,
 }
 
 

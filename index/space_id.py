@@ -11,9 +11,14 @@ from typing import Any
 #: Required keys, per the design doc's §3.1 worked example. All must be present and of a
 #: JSON-primitive type (str/int/float); extra keys are rejected so a caller can't silently
 #: add an unnormalized field that two otherwise-identical spaces disagree on.
+#: ``wiring_policy_sha256`` and ``time_policy_sha256`` (NVS-Kernel v7: how each port's arguments
+#: are built, how ``dt`` is taken) are part of the space: trajectories measured under a different
+#: wiring or time rule must not be composed. Adding them changes every ``space_id``; there is no
+#: stored experience to keep compatible with (Tomo, 2026-10-12).
 REQUIRED_KEYS = (
     "model_ref", "layer", "projection_sha256", "w_sha256",
-    "anchor_policy_sha256", "board_format", "quant_step_log2",
+    "anchor_policy_sha256", "wiring_policy_sha256", "time_policy_sha256",
+    "board_format", "quant_step_log2",
 )
 
 

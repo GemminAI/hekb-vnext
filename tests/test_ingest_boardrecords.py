@@ -57,6 +57,7 @@ def _manifest(sessions: list[dict], **overrides) -> dict:
         "sessions": sessions, "board_format": "36cell/1", "quant_step_log2": -30,
         "format_version": 1, "projection_sha256": "p" * 64, "w_sha256": "w" * 64,
         "anchor_policy_sha256": ANCHOR_POLICY,
+        "wiring_policy_sha256": "w" * 64, "time_policy_sha256": "t" * 64,
         "model_ref": "toy-model", "layer": 7,
     }
     manifest.update(overrides)

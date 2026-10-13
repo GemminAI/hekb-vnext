@@ -1062,6 +1062,8 @@ class SpaceIn(BaseModel):
     projection_sha256: str
     w_sha256: str
     anchor_policy_sha256: str
+    wiring_policy_sha256: str
+    time_policy_sha256: str
     board_format: str
     quant_step_log2: int
 

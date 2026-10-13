@@ -203,7 +203,8 @@ def test_causal_log_validated_by_require_hekbv3_trajectory_ext(tmp_path, monkeyp
 
     space = {
         "model_ref": "m", "layer": 1, "projection_sha256": "0" * 64, "w_sha256": "0" * 64,
-        "anchor_policy_sha256": "0" * 64, "board_format": "36cell/1", "quant_step_log2": -30,
+        "anchor_policy_sha256": "0" * 64, "wiring_policy_sha256": "0" * 64, "time_policy_sha256": "0" * 64,
+        "board_format": "36cell/1", "quant_step_log2": -30,
     }
     space_id = store_service.compute_space_id(space)
     payload = ExperiencePayload(
