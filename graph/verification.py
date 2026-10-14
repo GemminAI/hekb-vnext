@@ -50,6 +50,13 @@ RULES: dict[str, dict[str, str]] = {
         "text": "a HEXT measurement.observation_refs entry resolves to a stored trajectory (session id found in the "
                 "graph); an unresolved entry creates no edge and is recorded as UNRESOLVED",
     },
+    "R-VER-DOC-TOKEN-01": {
+        "version": "1",
+        "text": "token containment: a HEXT document's observation_ref names the token interval [seq_from, seq_to] "
+                "(0-based, both ends inclusive, token_index of the stored causal log) of a trajectory that has n_steps "
+                "tokens; VERIFIED if 0 <= seq_from <= seq_to <= n_steps-1, FAILED if outside, NOT_EVALUATED if the "
+                "reference has no #seq part, UNRESOLVED if the session does not resolve",
+    },
     "R-VER-REF-RESOLVE-01": {
         "version": "1",
         "text": "a hext/1.0 object_id resolves to a stored document: an id equal to a stored HEXT document's object.id, "
