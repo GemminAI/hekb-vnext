@@ -47,14 +47,15 @@ class ChainLog:
         return self._head
 
     def append(self, record: dict[str, Any], *, sync: bool = False) -> dict[str, Any]:
-        line = {"seq": self._seq, "prev": self._head, "record": record, "hash": _hash(self._head, record)}
+        digest = _hash(self._head, record)
+        line = {"seq": self._seq, "prev": self._head, "record": record, "hash": digest}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n")
             if sync:
                 handle.flush()
                 os.fsync(handle.fileno())
         self._seq += 1
-        self._head = line["hash"]
+        self._head = digest
         return line
 
     def verify(self) -> Iterator[dict[str, Any]]:
