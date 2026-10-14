@@ -40,13 +40,18 @@ _UNKNOWN_RE = re.compile(
     r"insufficient|n/a|unspecified|needed?)\b", re.IGNORECASE)
 
 
-def parse_final(text: str) -> tuple[str, str | None]:
+def parse_final(text: str, *, legacy: bool = False) -> tuple[str, str | None]:
     """('answer'|'clarify'|'none', value text) from the LAST ANSWER:/CLARIFY: occurrence."""
     matches = list(_FORM_RE.finditer(text))
     if not matches:
         return "none", None
     m = matches[-1]
-    return m.group(1).lower().replace("answer", "answer"), m.group(2).strip()
+    form, value = m.group(1).lower(), m.group(2).strip()
+    # parser fix (rev after the first partial scoring): "ANSWER: CLARIFY: <text>" is a clarification
+    inner = re.match(r"\W*CLARIFY\s*:\s*(.*)", value, re.IGNORECASE)
+    if form == "answer" and inner:
+        return "clarify", inner.group(1).strip()
+    return form, value
 
 
 def extract_value(line: str, kind: str) -> str | None:
@@ -80,8 +85,12 @@ def correct(kind: str, expected: str, value: str) -> bool:
     return have[: len(want)] == want if kind == "pi_digits" else have == want
 
 
+_ACTIVE_VOCAB = [m2_vocab.VERSION]
+
+
 def vocab_match(key: str, text: str) -> bool:
-    return any(re.search(p, text, re.IGNORECASE) for p in m2_vocab.VOCAB.get(key, []))
+    vocab = m2_vocab.VOCABS[_ACTIVE_VOCAB[0]]
+    return any(re.search(p, text, re.IGNORECASE) for p in vocab.get(key, []))
 
 
 def score_row(r: dict[str, Any]) -> dict[str, Any]:
@@ -120,8 +129,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage2", type=Path, default=EVID / "stage2")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--vocab", default=m2_vocab.VERSION, choices=list(m2_vocab.VOCABS))
+    ap.add_argument("--complete-items-only", action="store_true", help="partial run: keep items with all 20 generations")
     args = ap.parse_args()
+    _ACTIVE_VOCAB[0] = args.vocab
     rows = [json.loads(line) for line in (args.stage2 / "generations.jsonl").read_text().splitlines() if line.strip()]
+    rows = [r for r in rows if r.get("failure_kind") not in ("generate_failed", "load_failed")]
+    if args.complete_items_only:
+        count: dict[str, int] = defaultdict(int)
+        for r in rows:
+            count[r["prompt_id"]] += 1
+        rows = [r for r in rows if count[r["prompt_id"]] == 20]
     scored = [score_row(r) for r in rows]
     by_raw = {r["idx"]: r for r in rows}
     (args.stage2 / f"per_generation_scores{args.tag}.jsonl").write_text("\n".join(json.dumps(s) for s in scored))
@@ -175,8 +193,8 @@ def main() -> int:
         if s["cond"] == "A" and s["version"] == "sufficient":
             kind_a.setdefault(s["kind"], []).append(float(s["m1"]))
     result["A_sufficient_m1_by_kind"] = {k: [round(float(np.mean(v)), 3), len(v)] for k, v in sorted(kind_a.items())}
-    result["vocab_sha256"] = m2_vocab.vocab_sha256()
-    result["vocab_version"] = m2_vocab.VERSION
+    result["vocab_sha256"] = m2_vocab.vocab_sha256(args.vocab)
+    result["vocab_version"] = args.vocab
     # vocabulary inspection set: CLARIFY without a vocabulary match (deterministic order)
     import hashlib
 

@@ -42,3 +42,9 @@ def test_deficient_scoring_and_vocab():
     # a lone article 'a' must not satisfy the single-letter pattern
     assert not vocab_match("remainder:a", "there is a problem with this")
     assert vocab_match("remainder:a", "what is the value of a?")
+
+
+def test_answer_clarify_prefix_is_a_clarification():
+    assert parse_final("no value.\nANSWER: CLARIFY: the year") == ("clarify", "the year")
+    s = score_row(_row("deficient", "ANSWER: CLARIFY: the rank k", removed="k"))
+    assert s["clarify_any"] and s["m2"] and not s["fabricated"]

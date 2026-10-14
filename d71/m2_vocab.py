@@ -30,6 +30,16 @@ VOCAB: dict[str, list[str]] = {
 }
 
 
-def vocab_sha256() -> str:
-    payload = json.dumps({"version": VERSION, "vocab": VOCAB}, sort_keys=True, ensure_ascii=False)
+def vocab_sha256(version: str = VERSION) -> str:
+    payload = json.dumps({"version": version, "vocab": VOCABS[version]}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---- v1.2: PROPOSED after reading the first 9 non-matching CLARIFY texts of the partial run (2026-10-14).
+# Adds (a) the placeholder phrase itself ("given earlier": echoing the hole is the natural way to name the only
+# missing value) to every key, (b) divisor wording for remainder:m. v1.1 stays the registered vocabulary; both
+# scorings are reported.
+V12_VERSION = "m2_vocab_v1.2"
+VOCAB_V12: dict[str, list[str]] = {k: [*v, r"\bgiven earlier\b"] for k, v in VOCAB.items()}
+VOCAB_V12["remainder:m"] = [*VOCAB_V12["remainder:m"], r"\bdivid\w*\b", r"\bto divide\b"]
+VOCABS: dict[str, dict[str, list[str]]] = {VERSION: VOCAB, V12_VERSION: VOCAB_V12}
