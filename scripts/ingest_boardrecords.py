@@ -147,26 +147,57 @@ def _find_raw_log_file(raw_logs_root: Path, session_id: str) -> Path:
     return candidates[0]
 
 
+def _slot(raw_rec: dict, key: str, why: str):
+    """PRESENT with the original value, or MISSING with a reason -- never an empty fill-in."""
+    if key in raw_rec and raw_rec[key] is not None:
+        return {"status": "PRESENT", "value": raw_rec[key]}
+    return {"status": "MISSING", "value": None, "missing_reason": why}
+
+
 def _read_raw_causal_log(raw_logs_root: Path, session_id: str, board_records: list[dict]) -> tuple[list[dict], str, str]:
-    """[HEKBV3-BUILD004] Reads the raw TRJ003 per-token log matching `session_id`, checks
-    it 1:1 against the already-validated BoardRecord shard (`board_records`: same
-    (token_index, seq) order -- this is the join key, verified rather than assumed), and
-    returns (per-token causal-log records ready for `encode_causal_log_blob`,
-    raw_file_relative_path, raw_file_sha256). Stops (raises) on any count or ordering
-    mismatch -- never silently drops or reorders tokens."""
+    """[HEKBV3-BUILD004 + CAUSAL-ALIGN002 provenance contract v2] Reads the raw TRJ003 per-token
+    log matching `session_id`, checks it 1:1 against the already-validated BoardRecord shard
+    (same (token_index, seq) order -- the join key, verified rather than assumed), and returns
+    (per-token causal-log records, raw_file_relative_path, raw_file_sha256).
+
+    Each record keeps, in `provenance`, three things SEPARATELY: the reference to the raw record
+    (file sha256 + line number + sha256 of the raw line; the path is auxiliary), the token identity
+    (gen.token_id and the step index as different fields), and `cycle_provenance` / `position_64d`
+    verbatim (or MISSING + reason). HEXT is recorded as a reference only (the document is not
+    stored and is never reconstructed).
+
+    Duplicate raw lines: an identical repeat of an earlier line (same token_index, same bytes) is a
+    legitimate retry -- kept once, noted in `provenance.duplicates`; a repeat with different content
+    is a conflict and stops the ingest."""
     raw_path = _find_raw_log_file(raw_logs_root, session_id)
     raw_bytes = raw_path.read_bytes()
     raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     with gzip.open(raw_path, "rt", encoding="utf-8") as fh:
-        raw_lines = [line for line in fh.read().splitlines() if line]
-    if len(raw_lines) != len(board_records):
+        raw_lines = [(n, line) for n, line in enumerate(fh.read().splitlines(), start=1) if line]
+    kept: list[tuple[int, str, list[dict]]] = []
+    by_token: dict[int, tuple[str, int]] = {}
+    for n, line in raw_lines:
+        tok = json.loads(line).get("token_index")
+        digest = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        if tok in by_token:
+            first_digest, first_pos = by_token[tok]
+            if first_digest == digest:
+                kept[first_pos][2].append({"line_number": n, "record_sha256": digest, "kind": "identical_retry"})
+                continue
+            raise IngestError(
+                f"session {session_id}: raw log line {n} repeats token_index={tok} with DIFFERENT content "
+                f"(conflicting duplicate; line {kept[first_pos][0]} vs {n})"
+            )
+        by_token[tok] = (digest, len(kept))
+        kept.append((n, line, []))
+    if len(kept) != len(board_records):
         raise IngestError(
-            f"session {session_id}: raw log {raw_path} has {len(raw_lines)} records, "
+            f"session {session_id}: raw log {raw_path} has {len(kept)} distinct records, "
             f"BoardRecord shard has {len(board_records)}"
         )
     rel_path = str(raw_path.relative_to(raw_logs_root))
     out: list[dict] = []
-    for line_number, (line, board_rec) in enumerate(zip(raw_lines, board_records), start=1):
+    for (line_number, line, dups), board_rec in zip(kept, board_records):
         raw_rec = json.loads(line)
         if raw_rec.get("token_index") != board_rec["token_index"] or raw_rec.get("seq") != board_rec["seq"]:
             raise IngestError(
@@ -177,12 +208,35 @@ def _read_raw_causal_log(raw_logs_root: Path, session_id: str, board_records: li
         for field in ("ports", "cycle_raw", "trajectory_hash"):
             if field not in raw_rec:
                 raise IngestError(f"session {session_id}: raw log line {line_number} missing {field!r}")
+        gen = raw_rec.get("gen")
+        if isinstance(gen, dict) and "token_id" in gen:
+            token = {"status": "PRESENT", "value": {"token_id": gen["token_id"], "step_index": raw_rec["token_index"],
+                                                   "gen": gen}}
+        else:
+            token = {"status": "MISSING", "value": None,
+                     "missing_reason": "raw record has no gen.token_id"}
+        hext = (raw_rec["cycle_raw"] or {}).get("hext") or {}
+        prov = {
+            "schema": "hekbv3.causal_log.provenance/1",
+            "values_origin": "ingest_time_raw_log",
+            "raw_ref": {
+                "file_sha256": raw_sha256, "line_number": line_number,
+                "record_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(), "path_aux": rel_path,
+            },
+            "token": token,
+            "cycle_provenance": _slot(raw_rec, "cycle_provenance", "raw record has no cycle_provenance"),
+            "position_64d": _slot(raw_rec, "position_64d", "raw record has no position_64d"),
+            "hext": {"kind": "reference_only", "object_id": hext.get("object_id"), "document": "NOT_STORED"},
+        }
+        if dups:
+            prov["duplicates"] = dups
         out.append({
             "token_index": raw_rec["token_index"], "seq": raw_rec["seq"],
             "trajectory_hash": raw_rec["trajectory_hash"], "ports": raw_rec["ports"],
             "cycle_raw": raw_rec["cycle_raw"],
             "source_file": {"path": rel_path, "sha256": raw_sha256},
             "line_number": line_number,
+            "provenance": prov,
         })
     return out, rel_path, raw_sha256
 
@@ -336,7 +390,7 @@ def run_ingest(
         # which carries the actual content -- see module docstring and REPORT).
         if raw_logs_root is not None:
             causal_records, raw_rel_path, raw_sha256 = _read_raw_causal_log(raw_logs_root, session_id, records)
-            causal_bytes, causal_blob_sha256 = encode_causal_log_blob(causal_records)
+            causal_bytes, causal_blob_sha256 = encode_causal_log_blob(causal_records, schema="hekbv3.causal_log/2")
             causal_resp = client.put(f"/v3/blobs/{causal_blob_sha256}", content=causal_bytes,
                                       headers={"Content-Type": "application/octet-stream"})
             if causal_resp.status_code != 201:
@@ -346,7 +400,7 @@ def run_ingest(
                 )
             ext_hekbv3["causal_log"] = {
                 "blob_sha256": causal_blob_sha256, "n_steps": len(causal_records),
-                "schema": "hekbv3.causal_log/1",
+                "schema": "hekbv3.causal_log/2",
                 "source_file": {"path": raw_rel_path, "sha256": raw_sha256},
             }
         else:
