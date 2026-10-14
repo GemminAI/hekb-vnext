@@ -199,3 +199,77 @@ def test_full_content_is_identical_in_two_new_processes(tmp_path):
     # attributes and provenance are part of what was compared
     doc = next(n for n in full["nodes"] if n["node_type"] == "hext_document" and n["attrs"]["hext_kind"] == "annotation")
     assert doc["attrs"]["contributors"] and doc["attrs"]["agency"] and doc["attrs"]["hekb_object_id"] == "o1"
+
+
+# ---- what blob_sha256 covers, and what happens with duplicates ----------------------------------------------
+import hashlib  # noqa: E402
+
+from graph.hext_projection import ProjectionConflict, sealed_bytes  # noqa: E402
+from graph.model import GraphError  # noqa: E402
+
+
+def test_blob_sha256_is_over_the_sealed_canonical_bytes():
+    raw = _src()  # the P0 file carries one trailing newline that is not part of the sealed bytes
+    assert raw.endswith(b"\n") and not sealed_bytes(raw).endswith(b"\n")
+    p = project_document(raw, resolve_session=lambda s: None)
+    expect = hashlib.sha256(raw[:-1]).hexdigest()
+    assert p["nodes"][0]["attrs"]["blob_sha256"] == expect
+    # with or without the newline: the same identity
+    q = project_document(raw[:-1], resolve_session=lambda s: None)
+    assert q["nodes"][0]["attrs"]["blob_sha256"] == expect
+
+
+def test_non_canonical_or_tampered_input_is_refused_not_reserialised():
+    doc = json.loads(_src())
+    pretty = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    with pytest.raises(GraphError, match="not the sealed canonical form"):
+        project_document(pretty, resolve_session=lambda s: None)
+    bad = json.loads(_src())
+    bad["final_seal"]["state_hash"] = "sha256:" + "0" * 64
+    from graph.hext_projection import _enc
+
+    with pytest.raises(GraphError, match="state_hash does not match"):
+        project_document(_enc(bad).encode("utf-8"), resolve_session=lambda s: None)
+
+
+def test_identical_duplicates_are_merged_and_counted(tmp_path):
+    layer = HextProjectionLayer(tmp_path)
+    one = layer.rebuild([(_src(), {"hekb_object_id": "o"})], resolve_session=lambda s: None)
+    layer2 = HextProjectionLayer(tmp_path / "dup")
+    two = layer2.rebuild([(_src(), {"hekb_object_id": "o"}), (_src()[:-1], {"hekb_object_id": "o"})], resolve_session=lambda s: None)
+    assert two["duplicates_merged"] == 1 and one["duplicates_merged"] == 0
+    assert (two["nodes"], two["edges"], two["heads"]) == (one["nodes"], one["edges"], one["heads"])
+
+
+def test_same_bytes_with_different_metadata_is_a_conflict_and_leaves_the_layer_intact(tmp_path):
+    layer = HextProjectionLayer(tmp_path)
+    good = layer.rebuild([(_src(), {"hekb_object_id": "o1"})], resolve_session=lambda s: None)
+    with pytest.raises(ProjectionConflict, match="different metadata"):
+        layer.rebuild([(_src(), {"hekb_object_id": "o1"}), (_src(), {"hekb_object_id": "o2"})], resolve_session=lambda s: None)
+    assert layer.manifest() == good  # the previous projection was not replaced
+
+
+def test_same_state_hash_with_different_bytes_is_a_conflict(tmp_path):
+    from graph.hext_projection import _enc
+
+    signed = json.loads(_src())
+    signed["final_seal"]["signature"] = {"alg": "ecdsa-p256-sha256", "key_id": "k", "value": "v"}  # not part of state_hash
+    variant = _enc(signed).encode("utf-8")
+    assert json.loads(variant)["final_seal"]["state_hash"] == json.loads(_src())["final_seal"]["state_hash"]
+    with pytest.raises(ProjectionConflict, match="same state_hash with different bytes"):
+        HextProjectionLayer(tmp_path).rebuild([(_src(), {}), (variant, {})], resolve_session=lambda s: None)
+
+
+def test_same_object_id_with_different_state_hash_are_two_versions_not_a_conflict(tmp_path):
+    from graph.hext_projection import _enc
+
+    v2 = json.loads(_src())
+    v2["evidence"][0]["body"] = v2["evidence"][0]["body"] + "。"  # a different document with the same object.id
+    v2["final_seal"]["state_hash"] = "sha256:" + "0" * 64
+    from graph.hext_projection import _state_hash
+
+    v2["final_seal"]["state_hash"] = _state_hash(v2)
+    m = HextProjectionLayer(tmp_path).rebuild([(_src(), {}), (_enc(v2).encode("utf-8"), {})], resolve_session=lambda s: None)
+    assert m["documents"] == 2
+    assert list(m["same_object_id_versions"]) == ["hext2-three-sentences"]
+    assert len(m["same_object_id_versions"]["hext2-three-sentences"]) == 2

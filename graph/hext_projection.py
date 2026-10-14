@@ -38,6 +38,59 @@ def claim_node_id(state_hash: str, time_id: str) -> str:
     return f"{CLAIM_PREFIX}{state_hash}#{time_id}"
 
 
+class ProjectionConflict(GraphError):
+    """Inputs that cannot be merged without choosing (same content identity, different bytes or metadata)."""
+
+
+def _q(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if 0xD800 <= o <= 0xDFFF:
+            raise GraphError("lone surrogate")
+        out.append({'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
+            ch, f"\\u{o:04x}" if o < 0x20 else ch))
+    out.append('"')
+    return "".join(out)
+
+
+def _enc(v: Any) -> str:
+    """RFC 8785 for the sealable subset (ints, strings, bool, null, arrays, objects); keys by UTF-16 code units."""
+    if v is None:
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return _q(v)
+    if isinstance(v, list):
+        return "[" + ",".join(_enc(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ",".join(_q(k) + ":" + _enc(v[k]) for k in sorted(v, key=lambda k: k.encode("utf-16-be"))) + "}"
+    raise GraphError(f"not a sealable value: {type(v).__name__}")
+
+
+def sealed_bytes(raw: bytes) -> bytes:
+    """The bytes a ``blob_sha256`` is taken over: the sealed canonical (JCS) bytes of the document, exactly as
+    sealed. One trailing newline (a file convention, not part of the sealed bytes) is removed; any other
+    non-canonical form is refused (the projection never re-serialises a document to make it fit)."""
+    b = raw[:-1] if raw.endswith(b"\n") else raw
+    doc = _strict_load(b)
+    if _enc(doc).encode("utf-8") != b:
+        raise GraphError("document bytes are not the sealed canonical form (JCS); refusing to re-serialise")
+    return b
+
+
+def _state_hash(doc: dict[str, Any]) -> str:
+    d = json.loads(json.dumps(doc))
+    d["final_seal"].pop("state_hash", None)
+    d["final_seal"].pop("signature", None)
+    return "sha256:" + hashlib.sha256(_enc(d).encode("utf-8")).hexdigest()
+
+
 def _strict_load(raw: bytes) -> dict[str, Any]:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -67,8 +120,11 @@ def project_document(
     epistemic_status: str = "derived",
 ) -> dict[str, Any]:
     """Pure function of the document bytes and the two lookups. Returns {nodes, edges, unresolved}."""
+    raw = sealed_bytes(raw)
     doc = _strict_load(raw)
     sh = doc["final_seal"]["state_hash"]
+    if sh != _state_hash(doc):
+        raise GraphError("final_seal.state_hash does not match the document (node ids are derived from it)")
     did = doc_node_id(sh)
     known = set(known_doc_hashes)
     nodes: list[dict[str, Any]] = []
@@ -78,7 +134,7 @@ def project_document(
     attrs: dict[str, Any] = {
         "d70_kind": "Evidence", "epistemic_status": epistemic_status, "hext": doc["hext"], "hext_kind": doc["kind"],
         "hext_object_id": doc["object"]["id"], "state_hash": sh,
-        "blob_sha256": hashlib.sha256(raw).hexdigest(),
+        "blob_sha256": hashlib.sha256(raw).hexdigest(),  # over the sealed canonical bytes (see sealed_bytes)
         "hekb_object_id": hekb_object_id, "validated_level": validated_level,
         "object_type": doc["object"]["type"], "lifecycle": doc["object"]["lifecycle"],
         "contributors": doc["provenance"]["contributors"], "agency": doc["provenance"]["agency"],
@@ -153,8 +209,29 @@ class HextProjectionLayer:
         resolve_session: Callable[[str], str | None],
     ) -> dict[str, Any]:
         """docs: (raw bytes, {hekb_object_id, validated_level, epistemic_status})."""
-        parsed = sorted(docs, key=lambda d: hashlib.sha256(d[0]).hexdigest())
+        # identity of an input = sha256 of its sealed canonical bytes
+        by_blob: dict[str, tuple[bytes, dict[str, Any]]] = {}
+        merged = 0
+        for raw, meta in docs:
+            sb = sealed_bytes(raw)
+            h = hashlib.sha256(sb).hexdigest()
+            if h in by_blob:
+                if by_blob[h][1] != meta:  # same bytes, different metadata: which one is right?
+                    raise ProjectionConflict(f"identical document bytes {h[:12]} supplied with different metadata")
+                merged += 1  # identical bytes + identical metadata: a duplicate, merged (idempotent)
+                continue
+            by_blob[h] = (sb, meta)
+        parsed = [by_blob[h] for h in sorted(by_blob)]
         loaded = [_strict_load(raw) for raw, _m in parsed]
+        by_state: dict[str, list[str]] = {}
+        for (raw, _m), d in zip(parsed, loaded, strict=True):
+            by_state.setdefault(d["final_seal"]["state_hash"], []).append(hashlib.sha256(raw).hexdigest())
+        clash = {k: v for k, v in by_state.items() if len(v) > 1}
+        if clash:  # same content identity, different bytes (e.g. signature variants): do not choose
+            raise ProjectionConflict(f"same state_hash with different bytes: {sorted(clash)}")
+        versions: dict[str, list[str]] = {}
+        for d in loaded:
+            versions.setdefault(d["object"]["id"], []).append(d["final_seal"]["state_hash"])
         hashes = [d["final_seal"]["state_hash"] for d in loaded]
         claims = {d["final_seal"]["state_hash"]: {c["time_id"] for c in d["time"]["claims"]} for d in loaded}
         tmp = self.root.with_name("hext_projection.tmp")
@@ -174,7 +251,9 @@ class HextProjectionLayer:
                 unres.append(u)
         for log in (nodes, edges, unres):
             log.sync()
-        manifest = {"schema": SCHEMA, "documents": len(parsed), "nodes": len(nodes), "edges": len(edges),
+        manifest = {"schema": SCHEMA, "documents": len(parsed), "duplicates_merged": merged,
+                    "same_object_id_versions": {k: sorted(v) for k, v in sorted(versions.items()) if len(v) > 1},
+                    "nodes": len(nodes), "edges": len(edges),
                     "unresolved": len(unres),
                     "heads": {"nodes": nodes.head, "edges": edges.head, "unresolved": unres.head},
                     "input_blob_sha256": sorted(hashlib.sha256(r).hexdigest() for r, _m in parsed)}
