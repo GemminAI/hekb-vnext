@@ -1,6 +1,6 @@
 # EXP-D71-CONTEXT-001 v0.2-A — 段 1（材料と条件の作成）と段 2（Mac での小さな試行）の設計
 
-- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-A rev2`（PROPOSAL。設計のみ。実行・生成・ダウンロードはしていない。変更は末尾の「変更履歴」）
+- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-A rev3`（PROPOSAL。設計のみ。実行・生成・ダウンロードはしていない。変更は末尾の「変更履歴」）
 - **Date:** 2026-10-14
 - **元:** `EXP-D71-CONTEXT-001_v0.1.md`（Tomo がチャットに貼ったもの。原文のまま置いた。sha256 `a33f249d30ba8552d52ae987ae1be94c2f248269e3146a9c690c283349af74d3`）
 - **続き:** 段 3（RunPod）は `EXP-D71-CONTEXT-001_v0.2-B_runpod.md`
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | F1 | MSD0001 の「検証できる課題」は **8 種類**（recall: `nth_prime`・`fibonacci`・`pow2`・`pi_digits`、reasoning: `arith_chain`・`kth_largest`・`remainder`・`day_of_week`）。各セッションの `meta.json` の `task` に `kind`・`difficulty`・`prompt`・`expected`・`params` が残る。正誤はコードで決まる（`msd/tasks.py::verify`、最後の `ANSWER:` 行） | `src/msd/tasks.py`、`meta.json` | 「答えに必要な事実を 1 つ消す」を `params` の 1 項目の欠落として**機械的に**作れる（§2.3） |
 | F2 | 既存の分割（`splits.json`）は**クラス（benign／anomaly）ごとに**プロンプトの群で分けている。同じ `prompt_id` が両クラスに跨るものが 84 群あり、非 Locked の検証できる課題では **6 個の `prompt_id` が fit と dev に跨る**（全課題では 13 個） | `splits.json` の `report.prompt_groups_in_both_classes=84`、`prompt_id` の集計 | 「項目単位で分ける」には**新しい項目単位の分割**が要る。跨る 6 項目は両側から外す（§2.1） |
-| F3 | fit（benign_fit）は**全件が BENIGN**。fit の検証できる課題 87 セッション（外した後）はすべて正答 | `observed_labels.json`（機械の判定） | ライブラリ＝fit だと、**誤答の軌跡が 1 件も無い**。「失敗した経験」を渡せない（§2.1 の判断 J2） |
+| F3 | fit（benign_fit）は**全件が BENIGN**で、誤答の経験は無い。ただし検証できる課題の 87 セッション（跨る 6 項目を除く）の内訳は、機械で正答と判定 **83**、判定なし（`ANSWER:` 行が無く `correct=null`）**4**（p11-recall-0807・0891・0972・1024）。**検索に使えるのは機械で正答と確かめた 83 セッション（62 項目）**（段 1 で確認。rev2 までの「87 すべて正答」は誤り） | `observed_labels.json`（機械の判定） | ライブラリ＝fit だと、**誤答の軌跡が 1 件も無い**。「失敗した経験」を渡せない（§2.1 の判断 J2） |
 | F4 | fit（跨る 6 項目を除く）の検証できる課題は 87 セッション・64 項目で、種類別の項目数は arith_chain 7・day_of_week 12・kth_largest 13・nth_prime 5・pi_digits 6・pow2 6・remainder 15。**`fibonacci` は 0 件**。dev は 273 セッション・207 項目（arith 36・day 30・fib 16・kth 39・prime 25・pi 8・pow2 19・rem 34） | `meta.json` の集計 | 評価の種類は、ライブラリに同種の経験がある 7 種類に限る。ライブラリ側が薄い（5〜15 項目） |
 | F5 | 評価プロンプトの `prompt_id`・`prompt_sha256` が同じセッションは兄弟（最大 20）。dev の検証できる課題 207 項目のうち 177 は 1 セッション | 同上 | 評価の単位は**項目**（セッションではない） |
 | F6 | MSD0001 の生成は、全セッションに同じ共通システム指示（秘密のコード付き）、`T=0.7`・`top_p=0.95`・`max_new_tokens=768`・`min_new_tokens=128` | `msd/config.py` | ライブラリの軌跡と比べられる条件。段 2・3 の既定にする（§3.3、判断 J5） |
@@ -45,7 +45,7 @@
 1. **項目＝`prompt_id`**（F5）。分割は項目単位。同じ項目の兄弟（同じ `prompt_id`・`prompt_sha256`）を両側に置かない。
 2. 既存の分割の「跨り」（F2）を外す: 非 Locked で `prompt_id` が fit と dev の両方に現れる項目（検証できる課題 6）は、**ライブラリにも評価にも使わない**。
 3. **Locked の 703 件は使わない**（ID だけで除外する。Locked の `meta.json`・`hidden.npy` は開かない。Locked 側の兄弟の有無は確かめられないが、評価の項目は dev 側の項目なので、結果には影響しない）。
-4. ライブラリ（経験の取り出し元）は **fit**、評価は **dev**（Tomo の指定）。件数（F4）: ライブラリ 87 セッション・64 項目（7 種類）／評価の候補 273 セッション・207 項目（8 種類。ライブラリに同種が無い `fibonacci` を除くと約 191 項目）。
+4. ライブラリ（経験の取り出し元）は **fit**、評価は **dev**（Tomo の指定）。件数（F4）: ライブラリ 87 セッション（正答と確かめた 83 セッション・62 項目から検索する）／評価の候補 273 セッション・207 項目（8 種類。ライブラリに同種が無い `fibonacci` を除くと 191 項目）。
 5. 評価の項目の種類は、ライブラリに同種の項目がある **7 種類**（arith_chain・day_of_week・kth_largest・nth_prime・pi_digits・pow2・remainder）。種類ごとの上限・下限は §2.2。
 6. **記憶の腕**（同じ項目の別の事例がライブラリにある）は、追補 A の要因 2 として**別の数字**で報告する。本体の評価には入れない（F10）。
 7. **J2（要判断）**: fit は全件が正答（F3）。「誤った経験」を渡す条件（Q6 の「反対・失敗の例」）を作るには、dev の項目を**項目単位で 2 分**する（`sha256("D71|"+prompt_id)` の偶奇でライブラリ側／評価側）。推奨: **本体はユーザー指定のとおり fit をライブラリとし**、ライブラリ拡張（dev の半分）は**別の腕**として設計だけ残す。
@@ -169,8 +169,24 @@
 - **置き場所（J4=A、置き場所は Tomo が変更）**: `Llama31MLXProvider` は **`~/GemminAI/sensos`（GitHub: `GemminAI/sensos`）に追加**し、GitHub に commit してから `~/Projects/sensos` に**入れ直す**。**`~/Projects/sensos` は直接編集しない**。既存の `generate` の契約は変えない（追加のみ）。
   - **実施前に確認が要る点 [FACT・未確認]**: `~/GemminAI/sensos` の `main` には `sensos/core/inference.py`（`InferenceProvider`）も `sensos/core/providers/` も**ない**。`~/Projects/sensos` は別の系統（ブランチ `empty`、`7e29fe5`）で、これらのファイルは**未追跡**（`git ls-files` に無い）、他に未コミットの変更がある。つまり「`InferenceProvider` の型に合わせる」対象が `~/GemminAI/sensos` には存在しない。選択肢: (a) `~/GemminAI/sensos` に、`InferenceProvider`／`InferenceResult` の最小の定義と `Llama31MLXProvider` を**新しいモジュールとして追加**し（既存ファイルは変えない）、`~/Projects/sensos` の同名の型と互換にする、(b) `~/Projects/sensos` の未追跡の `core/` を先に別の手順で GitHub に載せる（本件の範囲外）。推奨は (a)。**入れ直しの前に、`~/Projects/sensos` の未コミットの変更の扱い（退避・照合）を Tomo と決める**。
   - **現状の保存（読み取りのみ。2026-10-14）**: `experiment-evidence/EXP-D71-CONTEXT-001/stage2/projects_sensos_snapshot/` に、`git status`（通常と porcelain）、追跡ファイルの `git diff`（4 ファイル・118 行追加、各 sha256）、未追跡ファイル 70 件の一覧と各 sha256、未追跡の `sensos/core/` のコピー（18 ファイル）、HEAD とブランチ（`empty`、`7e29fe5`、`origin/empty: ahead 41, behind 3`）を保存した。元のディレクトリは変更していない。コピーは参照用で、移植はしない。
+- **実装（2026-10-14、`~/GemminAI/sensos` のブランチ `feature/llama31-mlx-provider`、コミット `cc1dc1c`・`cb15500`、未 push）**: 新規パッケージ `packages/sensos-inference/`（`inference.py`: `InferenceResult`／`InferenceProvider`、`sampling.py`: HF の順序のサンプラー、`providers/llama31_mlx.py`: `Llama31MLXProvider`）。既存のモジュールは変えていない。テスト 112 件（重みなし。サンプラーは HF の 3 つの warper の NumPy 移植と確率を比較）。`failure_kind` は `load_failed`／`length_limit`／`eos_missing`／`generate_failed` を区別する。D71 用の環境は `/Volumes/SSD1TB/d71_work/venv`（mlx-lm 0.32.0、transformers 5.19.0、sensos-inference を `cb155004…` で固定）。`~/Projects/sensos` には触れていない。
 - **隠れ状態は取らない**。理由: (1) `mlx_lm.generate` は隠れ状態を返さない（ONSET002 B0）。フックで取ることはできても、(2) **MLX の 4bit と CUDA の bf16 では数値が違い**、同じ測定空間にならない（B0: 「different numerics, not the same measurement space」）。段 2 の目的は答えの正誤だけで、因果ログは不要。
 - **結果の記録**: `backend: "mlx-4bit"`、`model_ref: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit@<rev>"`。HEKB の `space_id`（`model_ref`・層・射影…で決まる）とは**無関係の別の空間**として記録し、段 3 の数値と**混ぜない**（集計表に `backend` の列を持たせ、段 3 の対比に段 2 の生成を入れない）。
+
+### 3.0 段 1 の実施結果（2026-10-14。生成なし。結果は `experiment-evidence/EXP-D71-CONTEXT-001/stage1/`）
+
+| 項目 | 結果 |
+|---|---|
+| 項目単位の分割 | 跨る 6 項目（`prompt_id`）を両側から除外。Locked は ID だけで除外し、開いていない。ライブラリ 87 セッション（正答 83・判定なし 4）、評価プール 191 項目（7 種類。`fibonacci` はライブラリに無く除外） |
+| 不足版 | 機械の検査: (i) 再描画と答えの一致 191/191、(ii) 答えが 2 通り以上に分かれる・(iii) 消した値が残らない を満たす不足版 **190/191**（最初の候補で落ちて別の値に替えたもの 7）。作れなかった 1（remainder） |
+| 漏洩の検査で落ちた | **8/191（4.2%）**（B の候補が 3 件に満たない 7［pi_digits・nth_prime］、不足版なし 1）。20% 超ではない。同種の答えが偶然一致（小さい答えの空間: day_of_week 15・remainder 4）は記録のみで許容 |
+| 使える項目 | 183（kth_largest 39・arith_chain 36・remainder 33・day_of_week 30・nth_prime 22・pow2 19・pi_digits 4。hard 111・easy 72） |
+| 条件ごとの文脈トークン数（平均。十分版／不足版。システム指示込み） | A 173／176、B 352／355、C 1,023／1,027、C′ 1,024／1,027、D 1,180／1,184 |
+| C と C′ | 観測要約部の平均 671.1／671.9 トークン、相対差の平均 0.8%・最大 1.95%（規則は ±10%）。全文脈の差の平均 −0.8 トークン |
+| 要約器 | `summarize_v1`: 1 要約の平均 220 トークン（目標の 100〜140 を超えた）。ソースの sha256 `ef74a2a8…`、テンプレートの sha256 `35c486ef…` |
+| 設定の指紋 | `retrieval_config_sha256` `3e7caa0f…`、`cprime_rule_sha256`（`cprime_rule.txt`）、M2 の語彙の sha256 `9db16aa9…` |
+| 段 2 の 40 項目 | 決定的（種類ごとに easy/hard を 20/20）: arith_chain 7・day_of_week 7・kth_largest 6・nth_prime 6・pow2 6・remainder 5・pi_digits 3 |
+| 層 32 の取り込み（確認 2 の実測） | `[T,1,4096]`＋`layer_index=0` は 8 層の `layer_index=7` と ports blob・`space_id`・causal_log blob・`object_id` がすべて一致（p11-recall-0932、144 トークン）。INFO001 の元の object とも `space_id`・ports blob が一致 |
 
 ### 3.2.1 生成条件の対応表（MSD0001 と段 2）
 
@@ -179,21 +195,21 @@
 | 行 | MSD0001（HF bf16） | 段 2（MLX 4bit） | 判定 | 段 2 の結果の読み方への影響 |
 |---|---|---|---|---|
 | モデル重み（rev・精度） | `meta-llama/Llama-3.1-8B-Instruct` rev `0e9e39f2…`、bf16 | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` rev `241a666d…`（2024-11-26）、4bit・group_size 64（重み 4,517,488,999 B）。変換元の Meta の rev は不明（`config.json` の `transformers_version` は 4.42.3） | **不一致** | 量子化の誤差があり、絶対的な正答率は段 3 と比べない。条件間の相対差だけを見る（§3.6） |
-| トークナイザー | rev `0e9e39f2…` の `tokenizer.json`（gated で今回は読めない） | MLX リポジトリの `tokenizer.json`（9,084,449 B） | **未確認** | 同一なら問題なし。違えば文脈のトークン数・入力が違う。取得後に sha256 を、MSD 側の記録がある場合は照合 |
-| チャットテンプレート | `apply_chat_template(add_generation_prompt=True)`（`backends.py`）。rev の `tokenizer_config.json` のテンプレート | MLX 側の `tokenizer_config.json` のテンプレート（4,614 文字、`Today Date` の既定値 `26 Jul 2024`） | **未確認** | 日付行などの差があれば、プロンプトが少し違う。取得後に生成されるプロンプト文字列を保存して、文脈ごとに記録 |
+| トークナイザー | rev `0e9e39f2…` の `tokenizer.json`（gated で今回は読めない） | MLX リポジトリの `tokenizer.json`（9,084,449 B、sha256 `bbc1904d…`）。**BPE の語彙（128,000）・merges・pre_tokenizer・normalizer は、ローカルの `Meta-Llama-3-8B` の `tokenizer.json` と完全に一致**（段 1 で確認） | **未確認**（meta-llama 3.1 の rev とは未照合） | 語彙・merges が Llama-3 と同じなので、文脈のトークン数は実質同じとみてよい。3.1 の rev との同一性は gated のため未確認 |
+| チャットテンプレート | `apply_chat_template(add_generation_prompt=True)`（`backends.py`）。rev の `tokenizer_config.json` のテンプレート | MLX 側の `tokenizer_config.json` のテンプレート（4,614 文字、sha256 `e10ca381…`、`Today Date` の既定値 `26 Jul 2024`。プロバイダが生成ごとに記録） | **未確認**（MSD 側の sha256 が取れない） | 日付行などの差があれば、プロンプトが少し違う。取得後に生成されるプロンプト文字列を保存して、文脈ごとに記録 |
 | システム指示 | `SYSTEM_PROMPT`（秘密のコード付き） | 同じ文字列（J5） | **一致** | ― |
 | ユーザーの出力形式 | `ANSWER:` のみ（`ANSWER_INSTRUCTION`） | `ANSWER:`／`CLARIFY:`（§3.3） | **不一致（設計による）** | 段 2 の応答の形式は MSD0001 のセッションと違う。M2・M5 のため。ライブラリの事例は元の形式のまま渡す（B・C の事例の本文は MSD0001 のもの） |
 | T・top_p・seed の扱い | `T=0.7`、`top_p=0.95`、`torch.manual_seed`（CUDA の乱数） | `T=0.7`、`top_p=0.95`、`mx.random.seed`（MLX の乱数） | **不一致**（値は同じ、実装が別） | 同じ種でも同じ出力にならない。サンプル単位の対応は取れず、分布としての比較のみ |
-| `top_k` | 明示せず。HF の `generate` 既定（`top_k=50`）が効く（transformers 4.48.3: `generation/utils.py` で `top_k` を warper に追加）。rev の `generation_config.json` は gated で未確認 | 指定しない（0＝無効） | **不一致**（MSD 側の実際の値は**未確認**） | 候補の裾の扱いが違う。段 2 の多様性が MSD より少し広い／狭いことがあり得る |
-| 温度と top_p の適用順 | HF: 温度 → top_k → top_p の順（`generation/utils.py` 1058〜1065 行）。top_p は温度後の分布で切る | `mlx_lm`: top_p を**温度の前の**対数確率で切り、その後に温度で `categorical`（`sample_utils.py`） | **不一致** | T=0.7 では HF のほうが核が狭く、MLX は裾の候補が残りやすい。段 2 の出力のばらつきは MSD より大きい側にずれ得る |
+| `top_k` | 明示せず。HF の `generate` 既定（`top_k=50`）が効く（transformers 4.48.3）。rev の `generation_config.json` は gated で未確認（既定値からの推定） | `top_k=50`（`Llama31MLXProvider` の既定。HF の `TopKLogitsWarper` と同じ算術） | **一致（実装で揃えた）**（MSD 側の 50 は既定値からの推定） | MSD 側の実際の値が 50 でなければ、候補の裾の扱いが違う |
+| 温度と top_p の適用順 | HF: 温度 → top_k → top_p の順（`generation/utils.py` 1058〜1065 行）。top_p は温度後の分布で切る | `sensos_inference.sampling`: 温度 → top_k=50 → top_p の順（HF の 3 つの warper と同じ算術。`mlx_lm` 既定の「温度の前に top_p」は使わない）。テストで HF 実装の NumPy 移植と確率が 1e-15 以内で一致 | **一致（実装で揃えた）** | ― |
 | `max_new_tokens` | 768 | 768 | **一致** | ― |
 | `min_new_tokens` | 128 | 指定しない | **不一致（設計による）** | 短い `CLARIFY:` を許す。MSD0001 の応答長（≥128）とは比べない（長さの比較はしない） |
 | 停止条件（EOS） | `pad_token_id=eos_token_id`。停止は rev の `generation_config.json` の `eos_token_id`（gated で今回は読めない。Llama-3.1 では [128001, 128008, 128009] のはずだが記録は無い） | `mlx_lm` は `config.json` の `eos_token_id`＝[128001, 128008, 128009] を停止集合にする（`utils.py:496`）。`tokenizer.eos_token` は `<|eot_id|>` | **未確認**（MLX 側は確認済み） | 一致していれば応答の終わりは同じ。違えば MSD の応答長・`ANSWER:` 行の到達率が違う。最初の 10 生成で終了理由（EOS／長さ上限）を確認 |
-| サンプラーの実装 | HF の `LogitsProcessor` の列 | `mlx_lm.sample_utils.make_sampler` | **不一致** | 上の 3 行の原因。実装が別なので、同じ設定でも同じ分布ではない |
+| サンプラーの実装（乱数） | HF: `softmax` → `torch.multinomial`（CUDA の乱数） | NumPy の `Generator(PCG64)`（種で固定） | **不一致**（乱数の実装。確率の算術は上 2 行で揃えた） | 分布は同じだが、同じ種でも同じトークン列にならない。サンプル単位の対応は取れない |
 | attention の実装 | `attn_implementation` を**指定していない**（`from_pretrained` に引数なし）。transformers 4.48.3 の `_autoset_attn_implementation` は、指定が無ければ torch ≥ 2.1.1 で `sdpa` を選ぶ（`_supports_sdpa=True`）→ **`sdpa` と推定**（`output_attentions` は要求していないので `eager` への退避は起きない）。**実行時の記録は無い** | MLX の融合した attention（`mx.fast.scaled_dot_product_attention`）、4bit の重み | **不一致**（MSD 側は推定） | 数値の差は 4bit の量子化誤差の中に埋もれる。分けて評価できない |
 | バッチ | 1 セッションずつ（バッチ 1。29.4 トークン/秒） | 1 生成ずつ（バッチ 1） | **一致** | ― |
 
-**集計**: 一致 3 行（システム指示、`max_new_tokens`、バッチ）、不一致 8 行（うち設計による 2 行）、未確認 3 行（トークナイザー、チャットテンプレート、停止条件の MSD 側）。**段 2 は MSD0001 と同じ測定条件ではない**。段 2 の値は、段 3 の問題数の概算にしか使わない（§3.6）。
+**集計（rev3）**: 一致 5 行（システム指示、`top_k`、温度と top_p の適用順、`max_new_tokens`、バッチ）、不一致 6 行（モデル重み、ユーザーの出力形式、T・top_p・seed の扱い、`min_new_tokens`、サンプラーの乱数、attention。うち設計による 2 行）、未確認 3 行（トークナイザー、チャットテンプレート、停止条件の MSD 側）。rev2 は 一致 3・不一致 8・未確認 3。**段 2 は MSD0001 と同じ測定条件ではない**。段 2 の値は、段 3 の問題数の概算にしか使わない（§3.6）。
 
 ### 3.3 生成の設定
 
@@ -290,6 +306,11 @@
 - **前提**: GRAPH_SEARCH v0.1 に辺の型（`retrieved_for`・`evaluates`・`retry_of` 等）を追加する設計が要る（追加のみ）。v0.2 の結果次第で、本候補は取り下げ・変更され得る。
 
 ## 変更履歴
+
+- **rev3（2026-10-14）**: Mac 側の実行（J4=(a) のプロバイダ追加、段 1、層 32 の実測）を反映。
+  - §3.0（新設）: 段 1 の実施結果。F3 の訂正（fit の 87 セッションのうち正答 83・判定なし 4。検索に使うのは 83）。
+  - §3.2: プロバイダの実装（コミット・テスト・環境）。
+  - §3.2.1: `top_k` と適用順を「一致（実装で揃えた）」に。乱数は「不一致」のまま。トークナイザー（Llama-3 の語彙・merges と一致）・チャットテンプレートの sha256 を追記。一致 5・不一致 6・未確認 3。
 
 - **rev2（2026-10-14）**: 追加の指示を反映。
   - §3.2: `~/Projects/sensos` の現状の保存（読み取りのみ）の結果を追記。
