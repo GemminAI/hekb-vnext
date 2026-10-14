@@ -97,7 +97,8 @@ def test_ingest_with_raw_logs_root_adds_causal_log(two_sessions_with_raw_logs, t
         record = store_service._read_json(store_service._object_path(s["object_id"]))
         causal_log = record["payload"]["ext"]["hekbv3"]["causal_log"]
         assert causal_log["n_steps"] == 12
-        assert causal_log["schema"] == "hekbv3.causal_log/1"
+        # CAUSAL-ALIGN002: ingest with raw logs now writes schema v2 (provenance contract); v1 blobs stay readable
+        assert causal_log["schema"] == "hekbv3.causal_log/2"
         assert causal_log["source_file"]["path"] == f"sessions/TRJ003_00{'0' if s['session_id']=='sess-0' else '1'}_{s['session_id']}.jsonl.gz"
 
         data = _get_blob(client, causal_log["blob_sha256"])

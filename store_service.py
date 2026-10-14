@@ -1200,6 +1200,12 @@ def _require_causal_log(ext: dict[str, Any]) -> None:
             detail=f"payload.ext.hekbv3.causal_log.n_steps={declared_n_steps} but the blob "
                    f"has {len(records)} record(s)",
         )
+    if causal_log.get("schema") == causal_log_blob.SCHEMA_V2:
+        for i, record in enumerate(records):
+            try:
+                causal_log_blob.validate_provenance(i, record)
+            except causal_log_blob.CausalLogBlobError as exc:
+                raise HTTPException(status_code=422, detail=f"causal_log provenance contract: {exc}") from exc
     for i, record in enumerate(records):
         if "cycle_raw" not in record or record["cycle_raw"] is None:
             raise HTTPException(status_code=422, detail=f"causal_log record {i} is missing cycle_raw")
