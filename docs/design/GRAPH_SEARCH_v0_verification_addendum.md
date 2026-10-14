@@ -130,3 +130,53 @@ Verification 記録 26,298 件、グラフ（本体）: ノード 39,519・辺 5
 | `hekb_object_id` が同じで HEXT 文書が違う | 属性として持つだけで、判定しない | HEKB の `object_id` は別の識別子 |
 
 - 拒否は、入力の集合全体に対する再構築の失敗として扱い、部分的な射影を書かない。
+
+## 9. トークンと HEXT 文書の包含関係 [提案。実装: `graph/containment.py`、規則 `R-VER-DOC-TOKEN-01`]
+
+**トークンの識別**: 軌跡の `object_id` と、保存された因果ログの `token_index`（0 始まり。盤面 blob の行番号と同じ）の組。トークンをノードにはしない（13,077 ノードを増やさない）。
+
+**範囲の定義**
+- `measurement.observation_refs` の `urn:gmm:nvs:session:<session_id>#seq=<a>-<b>` は、閉区間 [a, b]（**両端を含む**、`token_index`）を指す。
+- 区間が有効なのは `0 ≤ a ≤ b ≤ n_steps − 1`（`n_steps` は軌跡の因果ログの件数）。
+
+**ID の対応**
+- 文書の `observation_ref` の辺（`hextdoc:<state_hash>` → 軌跡の `object_id`、属性 `seq_from`・`seq_to`・`ref`）が、包含の根拠。新しい辺は作らない。
+- 「文書 D がトークン (T, t) を含む」⇔ D から T への `observation_ref` の辺のどれかが [seq_from, seq_to] に t を含む。
+
+**一意性**
+- (文書, 軌跡, トークン) ごとに、包含の事実は **1 つ**（同じ文書が同じ軌跡に複数の区間を持つ場合は和集合。2 つの事実にしない）。
+- 1 つのトークンを、**複数の文書が含んでよい**（別の文書、同じ `object.id` の別の版）。すべてを `node_id` で整列して列挙する。1 つに絞らない。
+
+**未解決・不正の扱い**
+| 状況 | 扱い |
+|---|---|
+| `#seq` が無い参照 | 区間を名指さない。何も含まない（全セッションとはみなさない）。Verification は `NOT_EVALUATED` |
+| セッションが解決しない | 辺が無いので何も含まない。`UNRESOLVED`（`R-VER-OBSREF-RESOLVE-01`） |
+| 区間が軌跡の範囲外 | 実在するトークンだけを含む。Verification は `FAILED`（理由つき） |
+| 範囲内 | `VERIFIED`（`verified_means`: 区間が `0..n_steps-1` に収まる） |
+
+包含は「範囲の包含」だけで、そのトークンの内容を文書が述べていることは保証しない。
+
+## 10. `hext_ref.document` の整理と `causal-align-token/2` [提案。実装: `graph/alignment_v2.py`]
+
+**問題**: Phase 2（CAUSAL-ALIGN002）の対応表の `hext_ref.document: "ABSENT"` は、カーネルの `hext/1.0` 参照の先の文書が無いという意味だったが、HEXT v2 の文書が生成された後では「HEXT の文書が無い」と読まれうる。
+
+| 旧（v1。Phase 2。変更しない） | 新（`causal-align-token/2`） | 意味 |
+|---|---|---|
+| `hext_ref` | `hext10_reference` | カーネルの `hext/1.0` wire object への参照（BLAKE2b でアドレス）。HEXT Standard の文書ではない |
+| `hext_ref.document: "ABSENT"` | `hext10_reference.document: "NOT_STORED"`、`resolution`（`UNRESOLVED` 等。Verification への参照つき） | その wire object の文書は保存されていない |
+| `parties_present.hext_reference` | `parties_present.hext10_reference` | 参照の有無 |
+| `parties_present.hext_document`（常に False） | `parties_present.hext_v2_document` | HEXT v2 の文書が、このトークンを含むか（§9） |
+| （なし） | `hext_v2_documents[]` | 含む文書（`hextdoc`・`state_hash`・`hext_object_id`・区間・範囲の Verification） |
+| `alignment_id` | `alignment_id_v1`（保持）、`alignment_id`（v2 の本体の SHA-256） | |
+
+- **旧と新を区別する**: `hext10_reference` は旧世代の参照、`hext_v2_documents` は新世代の文書。互いに置き換えない。`hext10_reference.resolution` は UNRESOLVED のままで、HEXT v2 文書が存在してもそれが解決先になるわけではない（識別子が別物）。
+- v1 の記録は変更しない。v2 は別ファイル（`phase2_alignments_v2.jsonl`）。
+
+## 11. 実測（48 件。Phase 2 を固定したうえで）[FACT]
+
+- Phase 2 の成果物と、依存した全成果物の SHA-256 を `phase2_freeze_manifest.json`（72 ファイル）に固定した。接続の照合結果は `phase2_connection_report.json`。
+- 文書 ↔ 軌跡の照合（`blob_sha256`・`hekb_object_id`・`observation_ref` の指す軌跡）48/48。
+- v2 の対応表 13,077 件。v1 との差は、宣言した変更（改名・追加・`alignment_id`）だけ。意図しない差 0、`identity`・`temporal`・`semantic` の状態は 13,077/13,077 で不変。
+- 13,077 トークンのすべてが、ちょうど 1 つの文書に含まれる（範囲 0..n_steps−1）。範囲の Verification は 48 件が `VERIFIED`。
+- 2 回の実行で、v2 の記録の SHA-256 と接続レポートが一致した。拡張したグラフは別ディレクトリ（`graph_data_v2/`）で、元の `graph_data/` は不変。
