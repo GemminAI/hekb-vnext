@@ -1,0 +1,127 @@
+# ruff: noqa: E501
+"""HEXT v2 -> graph projection. Test data: the P0 example documents of GemminAI/hext (v2-draft) and a minimal
+synthetic source document built with the reference implementation. These are TEST DATA, not experimental data."""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+HEXT = Path.home() / "GemminAI" / "hext"
+EX = HEXT / "examples" / "v2"
+sys.path.insert(0, str(HEXT / "reference" / "python"))
+pytest.importorskip("hext2")
+
+from hext2.create import create_and_seal  # noqa: E402
+
+from graph.hext_projection import HextProjectionLayer, doc_node_id, project_document  # noqa: E402
+from graph.store import GraphStore  # noqa: E402
+from graph.verification import make_verification, write_verification  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not (EX / "source-three-sentences.hext2.json").exists(), reason="P0 examples absent")
+H = "c" * 64
+
+
+def _src() -> bytes:
+    return (EX / "source-three-sentences.hext2.json").read_bytes()
+
+
+def _ann() -> bytes:
+    return (EX / "annotation-three-sentences.hext2.json").read_bytes()
+
+
+def _obs_doc(session: str = "s1", rng: str = "0-9") -> bytes:
+    t = "2026-10-15T00:00:00Z"
+    _d, s = create_and_seal(
+        object_id=f"urn:test:{session}", object_type="document.test",
+        evidence=[{"evidence_id": "ev-1", "format": "text/plain; charset=utf-8", "body": "x"}],
+        contributors=[{"agent": "system:test", "role": "generator"}], primary_generator="ai", human_touch="0.0",
+        ledger=[{"t": t, "type": "SYSTEM", "actor": "system:test", "delta": 1}], sealed_at=t,
+        measurement={"observation_refs": [f"urn:gmm:nvs:session:{session}#seq={rng}"], "space_id": "sp"},
+    )
+    return s.canonical_bytes
+
+
+def test_source_projection_and_separate_identity_attributes():
+    p = project_document(_src(), resolve_session=lambda s: None, hekb_object_id="hekb-obj-1", validated_level=2)
+    sh = json.loads(_src())["final_seal"]["state_hash"]
+    doc = next(n for n in p["nodes"] if n["node_type"] == "hext_document")
+    assert doc["node_id"] == doc_node_id(sh) == "hextdoc:" + sh
+    a = doc["attrs"]
+    assert a["hext_object_id"] == "hext2-three-sentences" and a["state_hash"] == sh and a["hekb_object_id"] == "hekb-obj-1"
+    assert len({a["hext_object_id"], a["state_hash"], a["hekb_object_id"]}) == 3
+    claims = [n for n in p["nodes"] if n["node_type"] == "hext_claim"]
+    assert len(claims) == 3 and all(c["node_id"].startswith(f"hextclaim:{sh}#t") for c in claims)
+    assert sum(e["type"] == "has_claim" for e in p["edges"]) == 3
+
+
+def test_only_hext_derived_node_types_are_created():
+    for raw in (_src(), _ann(), _obs_doc()):
+        p = project_document(raw, resolve_session=lambda s: "traj-1", known_doc_hashes=[])
+        assert {n["node_type"] for n in p["nodes"]} <= {"hext_document", "hext_claim"}
+        assert {e["type"] for e in p["edges"]} <= {"has_claim", "time_relation", "observation_ref", "derived_from"}
+
+
+def test_annotation_relations_and_derived_from():
+    src_hash = json.loads(_src())["final_seal"]["state_hash"]
+    p = project_document(_ann(), resolve_session=lambda s: None, known_doc_hashes=[src_hash],
+                         known_claims={src_hash: {"t1", "t2", "t3"}})
+    rel = [e for e in p["edges"] if e["type"] == "time_relation"]
+    assert len(rel) == 2 and rel[0]["src"].startswith(f"hextclaim:{src_hash}#")
+    assert [e["type"] for e in p["edges"] if e["type"] == "derived_from"] == ["derived_from"] and not p["unresolved"]
+    q = project_document(_ann(), resolve_session=lambda s: None, known_doc_hashes=[])
+    assert not any(e["type"] == "derived_from" for e in q["edges"])
+    assert {u["kind"] for u in q["unresolved"]} == {"derived_from", "relation_endpoint"}
+    assert not any(e["type"] == "time_relation" for e in q["edges"])
+
+
+def test_unresolved_observation_ref_makes_no_edge():
+    ok = project_document(_obs_doc("s1"), resolve_session={"s1": "traj-1"}.get)
+    e = [x for x in ok["edges"] if x["type"] == "observation_ref"]
+    assert len(e) == 1 and e[0]["dst"] == "traj-1" and e[0]["attrs"]["seq_from"] == 0 and e[0]["attrs"]["seq_to"] == 9
+    bad = project_document(_obs_doc("zz"), resolve_session={"s1": "traj-1"}.get)
+    assert not any(x["type"] == "observation_ref" for x in bad["edges"])
+    assert bad["unresolved"] == [{"kind": "observation_ref", "document": bad["document"], "ref": "urn:gmm:nvs:session:zz#seq=0-9",
+                                  "session_id": "zz", "reason": "no stored trajectory with this session id in the graph"}]
+
+
+def test_rebuild_is_identical_and_keeps_non_hext_records(tmp_path):
+    docs = [(_src(), {}), (_ann(), {}), (_obs_doc("s1"), {"hekb_object_id": "o1"})]
+    layer = HextProjectionLayer(tmp_path)
+    m1 = layer.rebuild(docs, resolve_session={"s1": "traj-1"}.get)
+    # a Verification lives in the main store; rebuilding the projection must not touch it
+    store = GraphStore(tmp_path, v01=False)
+    store.add_node("traj-1", "trajectory", kind="observation", verification="unverified", attrs={})
+    doc_id = next(n["node_id"] for n in layer.nodes() if n["node_type"] == "hext_document" and n["attrs"]["hext_object_id"] == "urn:test:s1")
+    ver = make_verification(rule_id="R-VER-DOC-TRAJ-01", subject_a=doc_id, subject_b="traj-1", status="VERIFIED",
+                            verified_means="session id equal", inputs=[{"role": "hext_document", "sha256": H}])
+    write_verification(store, ver, known_ids={doc_id})
+    nodes_before = [json.dumps(n, sort_keys=True) for n in store.nodes()]
+    shutil_rmtree = __import__("shutil").rmtree
+    shutil_rmtree(layer.root)  # delete the projection ...
+    m2 = layer.rebuild(list(reversed(docs)), resolve_session={"s1": "traj-1"}.get)  # ... and rebuild (input order differs)
+    assert m1 == m2
+    assert [json.dumps(n, sort_keys=True) for n in GraphStore(tmp_path, v01=False).nodes()] == nodes_before
+    assert any(n["node_type"] == "verification" for n in GraphStore(tmp_path, v01=False).nodes())
+
+
+def test_projection_is_identical_in_two_new_processes(tmp_path):
+    code = (
+        "import sys, json; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "from graph.hext_projection import HextProjectionLayer\n"
+        "d=Path(%r); docs=[(Path(%r).read_bytes(),{}),(Path(%r).read_bytes(),{})]\n"
+        "m=HextProjectionLayer(d).rebuild(docs, resolve_session=lambda s: None)\n"
+        "print(json.dumps(m['heads'], sort_keys=True))\n"
+    )
+    outs = []
+    for i in range(2):
+        r = subprocess.run(
+            [sys.executable, "-c", code % (str(Path(__file__).resolve().parent.parent), str(HEXT / "reference" / "python"),
+                                           str(tmp_path / f"p{i}"), str(EX / "source-three-sentences.hext2.json"),
+                                           str(EX / "annotation-three-sentences.hext2.json"))],
+            capture_output=True, text=True, check=True, env={"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"})
+        outs.append(r.stdout.strip())
+    assert outs[0] == outs[1] and json.loads(outs[0])["nodes"]

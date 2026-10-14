@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path.home() / "GemminAI/hext/reference/python"))
 from hext2.errors import HextError  # noqa: E402
 from hext2.verify import verify as hext2_verify  # noqa: E402
 
+from graph.hext_projection import HextProjectionLayer  # noqa: E402
 from graph.store import GraphStore  # noqa: E402
 from graph.verification import make_verification, unresolved_reverse_index, write_verification  # noqa: E402
 
@@ -65,9 +66,22 @@ def build(out_graph_dir: Path) -> dict[str, Any]:
              "kinds": "object_id, lineage_id, causal/ports blob sha256, HEXT v2 object.id/state_hash/blob sha256"}
     counts: Counter[str] = Counter()
     records: list[dict[str, Any]] = []
+    # ---- HEXT v2 documents -> graph projection (derived layer, separate logs) -------------------------
+    docs_in: list[tuple[bytes, dict[str, Any]]] = []
+    for sid in sessions:
+        b = (GEN / "docs" / f"{sid}.hext2.json").read_bytes()
+        try:
+            lvl = hext2_verify(b, level=2).level
+        except HextError:
+            lvl = -1
+        docs_in.append((b, {"hekb_object_id": objs[sid][1]["object_id"], "validated_level": lvl, "epistemic_status": "derived"}))
+    session_to_traj = {sid: objs[sid][1]["object_id"] for sid in sessions}
+    layer = HextProjectionLayer(out_graph_dir)
+    proj = layer.rebuild(docs_in, resolve_session=session_to_traj.get)
+    proj_ids = {n["node_id"] for n in layer.nodes()}
 
     def emit(ver: dict[str, Any]) -> None:
-        write_verification(store, ver)
+        write_verification(store, ver, known_ids=proj_ids)
         records.append(ver)
         counts[f"{ver['rule']['id']}:{ver['status']}"] += 1
 
@@ -97,9 +111,7 @@ def build(out_graph_dir: Path) -> dict[str, Any]:
                        attrs={"n_steps": n, "schema": ext["causal_log"].get("schema"), "epistemic_status": "observed"})
         store.add_node(raw_node, "raw_log", kind="observation", verification="unverified",
                        attrs={"session_id": sid, "file": raw_path.name, "epistemic_status": "observed"})
-        store.add_node(doc_node, "hext_document", kind="observation", verification="unverified",
-                       attrs={"object_id": c["document_object_id"], "blob_sha256": doc_sha, "kind": doc["kind"],
-                              "epistemic_status": "derived", "generated_from": "stored files (HEXT-V2-GEN001)"})
+        assert doc_node in proj_ids  # the document node comes from the projection layer, not from this store
         # ---- R-VER-RAW-01 --------------------------------------------------------------------------------
         ok_file = raw_sha == ext["causal_log"]["source_file"]["sha256"]
         mism = 0
@@ -165,8 +177,16 @@ def build(out_graph_dir: Path) -> dict[str, Any]:
                 inputs=[{"role": "causal_log", "sha256": cl_sha}],
                 detail={"session": sid, "token_index": t, "target_id": h, "search_scope": scope},
                 reason=None if resolved else "no stored document with this id could be confirmed in the search scope (not a statement that none exists)"))
+    # unresolved observation_refs: no edge was made; the failure is a Verification record in the main store
+    for u in layer.unresolved():
+        if u["kind"] == "observation_ref":
+            emit(make_verification(
+                rule_id="R-VER-OBSREF-RESOLVE-01", subject_a=u["document"], subject_b=None, status="UNRESOLVED",
+                verified_means="", inputs=[{"role": "hext_document", "sha256": u["document"].split(":")[-1]}],
+                detail={"ref": u["ref"], "session": u.get("session_id")}, reason=u["reason"]))
     store.sync()
-    return {"store": store, "records": records, "counts": dict(counts), "scope": scope, "sessions": len(sessions)}
+    return {"store": store, "records": records, "counts": dict(counts), "scope": scope, "sessions": len(sessions),
+            "projection": proj, "layer": layer, "docs_in": docs_in, "session_to_traj": session_to_traj}
 
 
 def main() -> int:
@@ -191,6 +211,16 @@ def main() -> int:
         r = build(d)
         heads.append((r["store"].nodes_log.head, r["store"].edges_log.head))
         shutil.rmtree(d)
+    # rebuild the projection from the same documents: the HEXT-derived part is identical and the
+    # Verification records of the main store are untouched
+    layer: HextProjectionLayer = res["layer"]
+    verifs_before = sorted(n["node_id"] for n in store.nodes() if n["node_type"] == "verification")
+    heads_before = layer.manifest()["heads"]
+    layer.rebuild(res["docs_in"], resolve_session=res["session_to_traj"].get)
+    verifs_after = sorted(n["node_id"] for n in GraphStore(gdir, v01=False).nodes() if n["node_type"] == "verification")
+    rebuild_check = {"projection_heads_equal": layer.manifest()["heads"] == heads_before,
+                     "verification_records_before": len(verifs_before), "verification_records_after": len(verifs_after),
+                     "verification_ids_equal": verifs_before == verifs_after}
     after = tree_digest(DATA)
     rep = {
         "sessions": res["sessions"], "verification_records": len(res["records"]), "counts_by_rule_status": res["counts"],
@@ -200,6 +230,8 @@ def main() -> int:
         "reproducible_heads_equal": heads[0] == heads[1] == (store.nodes_log.head, store.edges_log.head),
         "unresolved_targets": len(rev), "unresolved_references": sum(len(v) for v in rev.values()),
         "source_dir_digest": {"before": before[0], "after": after[0], "files": before[1], "unchanged": before == after},
+        "hext_projection": {k: res["projection"][k] for k in ("documents", "nodes", "edges", "unresolved", "heads")},
+        "projection_rebuild_check": rebuild_check,
         "note": "Verification relates existing records; it asserts neither sameness of meaning nor causality.",
     }
     (out / "report.json").write_text(json.dumps(rep, indent=1, sort_keys=True))
