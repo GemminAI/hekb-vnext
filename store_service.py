@@ -1431,5 +1431,10 @@ def main() -> None:
     asyncio.run(_run())
 
 
+# Graph layer (GRAPH_SEARCH v0.1): read-only routes beside the existing ones; no existing route changes.
+from graph.api import make_router as _graph_router  # noqa: E402
+
+app.include_router(_graph_router(_data_dir))
+
 if __name__ == "__main__":
     main()
