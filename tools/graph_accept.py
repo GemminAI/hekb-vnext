@@ -65,7 +65,8 @@ def acceptance(data_dir: Path) -> dict[str, Any]:
                 probs.append(("risk", r["hext"]["risk"], row["hext_risk"]))
             if r["hext"]["tier"] != row["hext_tier"]:
                 probs.append(("tier", r["hext"]["tier"], row["hext_tier"]))
-            if not close(float(r["causal_log"]["record"]["ports"]["P01"]["timestamp_ns"]) / 1e9, float(row["event_time_s"])):
+            t_ns = float(r["causal_log"]["record"]["ports"]["P01"]["timestamp_ns"])
+            if not close(t_ns / 1e9, float(row["event_time_s"])):
                 probs.append(("time", None, row["event_time_s"]))
             for port in PORTS:
                 key = f"val_{port}"
@@ -123,7 +124,9 @@ def main() -> int:
     result["files_identical_to_source"] = {"same": same, "total": total}
     result["source_tree"] = dict(zip(("sha256", "files"), tree_hash(args.src), strict=True))
     args.out.write_text(json.dumps(result, indent=1, default=str))
-    print(json.dumps({k: (v if k != "q2_vs_trace001" else {x: y for x, y in v.items() if x != "mismatch"}) for k, v in result.items()}, indent=1, default=str))
+    brief = dict(result)
+    brief["q2_vs_trace001"] = {x: y for x, y in result["q2_vs_trace001"].items() if x != "mismatch"}
+    print(json.dumps(brief, indent=1, default=str))
     return 0
 
 

@@ -125,7 +125,10 @@ def ingest_session(
     )
     cl_node, st_node = f"blob:{cl_sha}", f"blob:{st_sha}"
     store.add_node(
-        cl_node, "causal_log", verification="machine_verified", attrs={"n_steps": n, "schema": "hekbv3.causal_log/1"}
+        cl_node,
+        "causal_log",
+        verification="machine_verified",
+        attrs={"n_steps": n, "schema": "hekbv3.causal_log/1"},
     )
     store.add_node(
         st_node,

@@ -24,7 +24,9 @@ OBSERVATION_EXTRAS = ("annotations",)
 def _strip_ports(ports: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for port, obs in ports.items():
-        out[port] = {k: v for k, v in obs.items() if k not in OBSERVATION_EXTRAS} if isinstance(obs, dict) else obs
+        if isinstance(obs, dict):
+            obs = {k: v for k, v in obs.items() if k not in OBSERVATION_EXTRAS}
+        out[port] = obs
     return out
 
 

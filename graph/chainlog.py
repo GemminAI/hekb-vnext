@@ -66,7 +66,7 @@ class ChainLog:
                 line = json.loads(raw)
                 if line["seq"] != seq or line["prev"] != prev or line["hash"] != _hash(prev, line["record"]):
                     raise ChainLogError(f"{self.path}: chain broken at seq {seq}")
-                prev, seq = line["hash"], seq + 1
+                prev, seq = str(line["hash"]), seq + 1
                 yield line
 
     def sync(self) -> None:

@@ -17,13 +17,14 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 EVID = Path.home() / "vaults/20260124/experiment-evidence"
 MSD = Path("/Volumes/SSD1TB/EXP-MSD0001 v1.1")
 N_EXTRA = 11
 
 
-def select() -> dict[str, object]:
+def select() -> dict[str, Any]:
     assignment = json.loads((MSD / "splits.json").read_text())["assignment"]
     objects = json.loads((EVID / "PORT38-INFO001/regeneration_summary.json").read_text())["object_ids"]
     with (EVID / "PORT38-TRACE001/summary.csv").open() as handle:

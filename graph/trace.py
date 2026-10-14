@@ -14,6 +14,7 @@ from graph import catalog
 from graph.blobs import read_blob
 from graph.store import GraphStore
 
+
 def _flat(x: Any) -> list[float]:
     if isinstance(x, bool):
         return [float(x)]
