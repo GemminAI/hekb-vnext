@@ -125,3 +125,77 @@ def test_projection_is_identical_in_two_new_processes(tmp_path):
             capture_output=True, text=True, check=True, env={"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"})
         outs.append(r.stdout.strip())
     assert outs[0] == outs[1] and json.loads(outs[0])["nodes"]
+
+
+# ---- full-content determinism and input-order independence --------------------------------------------
+def _dump(layer: HextProjectionLayer) -> dict:
+    """Every stored record, in full (node id, type, kind, verification and ALL attrs; edge type, src, dst and ALL
+    attrs; unresolved records), plus the manifest. Not only the chain heads."""
+    return {"nodes": layer.nodes(), "edges": layer.edges(), "unresolved": layer.unresolved(), "manifest": layer.manifest()}
+
+
+def _canon(d: dict) -> str:
+    return json.dumps(d, sort_keys=True, ensure_ascii=False)
+
+
+def test_source_and_annotation_order_does_not_change_the_final_projection(tmp_path):
+    resolve = {"s1": "traj-1"}.get
+    a, b = (_src(), {"hekb_object_id": "o-src"}), (_ann(), {"hekb_object_id": "o-ann"})
+    third = (_obs_doc("s1"), {"hekb_object_id": "o-obs"})
+    layers = {}
+    for name, order in {"src_first": [a, b, third], "ann_first": [b, a, third], "reversed": [third, b, a]}.items():
+        layer = HextProjectionLayer(tmp_path / name)
+        layer.rebuild(order, resolve_session=resolve)
+        layers[name] = _dump(layer)
+    base = _canon(layers["src_first"])
+    assert _canon(layers["ann_first"]) == base and _canon(layers["reversed"]) == base
+    d = layers["ann_first"]
+    # the annotation's relations resolved to the SOURCE's claims, whatever the order of arrival
+    src_hash = json.loads(_src())["final_seal"]["state_hash"]
+    rel = [e for e in d["edges"] if e["type"] == "time_relation"]
+    assert len(rel) == 2 and all(e["src"].startswith(f"hextclaim:{src_hash}#") and e["dst"].startswith(f"hextclaim:{src_hash}#") for e in rel)
+    assert any(e["type"] == "derived_from" and e["dst"] == f"hextdoc:{src_hash}" for e in d["edges"])
+    assert d["unresolved"] == []
+    # same content as unordered sets as well
+    for kind in ("nodes", "edges"):
+        assert {_canon(x) for x in layers["src_first"][kind]} == {_canon(x) for x in layers["reversed"][kind]}
+
+
+def test_late_arrival_of_the_source_gives_the_same_projection_as_having_it_from_the_start(tmp_path):
+    resolve = {"s1": "traj-1"}.get
+    both = [(_src(), {}), (_ann(), {})]
+    only_ann = HextProjectionLayer(tmp_path / "early")
+    only_ann.rebuild([(_ann(), {})], resolve_session=resolve)
+    partial = _dump(only_ann)
+    assert {u["kind"] for u in partial["unresolved"]} == {"derived_from", "relation_endpoint"}
+    assert not any(e["type"] in ("time_relation", "derived_from") for e in partial["edges"])
+    only_ann.rebuild(both, resolve_session=resolve)  # the source arrives later; the projection is rebuilt
+    fresh = HextProjectionLayer(tmp_path / "fresh")
+    fresh.rebuild(list(reversed(both)), resolve_session=resolve)
+    assert _canon(_dump(only_ann)) == _canon(_dump(fresh))
+
+
+def test_full_content_is_identical_in_two_new_processes(tmp_path):
+    code = (
+        "import sys, json; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "from graph.hext_projection import HextProjectionLayer\n"
+        "docs=[(Path(%r).read_bytes(),{'hekb_object_id':'o1'}),(Path(%r).read_bytes(),{'hekb_object_id':'o2'})]\n"
+        "l=HextProjectionLayer(Path(%r)); l.rebuild(docs, resolve_session=lambda s: None)\n"
+        "print(json.dumps({'nodes':l.nodes(),'edges':l.edges(),'unresolved':l.unresolved(),'manifest':l.manifest()},"
+        " sort_keys=True, ensure_ascii=False))\n"
+    )
+    outs = []
+    for i in range(2):
+        r = subprocess.run(
+            [sys.executable, "-c", code % (str(Path(__file__).resolve().parent.parent), str(HEXT / "reference" / "python"),
+                                           str(EX / "annotation-three-sentences.hext2.json"),
+                                           str(EX / "source-three-sentences.hext2.json"), str(tmp_path / f"q{i}"))],
+            capture_output=True, text=True, check=True, env={"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"})
+        outs.append(r.stdout)
+    assert outs[0] == outs[1]
+    full = json.loads(outs[0])
+    assert full["nodes"] and full["edges"]
+    # attributes and provenance are part of what was compared
+    doc = next(n for n in full["nodes"] if n["node_type"] == "hext_document" and n["attrs"]["hext_kind"] == "annotation")
+    assert doc["attrs"]["contributors"] and doc["attrs"]["agency"] and doc["attrs"]["hekb_object_id"] == "o1"
