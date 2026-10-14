@@ -30,13 +30,23 @@ V01_ALLOWED: Final = frozenset(
 #: Verifications that may be handed to a RAG context as evidence (Q6). ``unverified`` never is.
 EVIDENCE_VERIFICATIONS: Final = frozenset({"machine_verified", "human_verified"})
 
-NODE_TYPES: Final = ("trajectory", "causal_log", "source_text", "hext_kernel", "policy_set")
+#: Epistemic position of a record (addendum "verification"): where the record stands in knowledge, NOT what
+#: kind of data it is. A derived record that gets verified stays ``derived``; the verification is a separate
+#: ``verified_relation`` record.
+EPISTEMIC_STATUSES: Final = ("observed", "derived", "verified_relation")
+VERIFICATION_STATUSES: Final = ("VERIFIED", "FAILED", "NOT_EVALUATED", "UNRESOLVED")
+
+NODE_TYPES: Final = (
+    "trajectory", "causal_log", "source_text", "hext_kernel", "policy_set",
+    "raw_log", "hext_document", "verification",
+)
 EDGE_TYPES: Final = (
     "has_causal_log",  # trajectory -> causal_log blob (token range)
     "has_source_text",  # trajectory -> source_text blob (token range, character range)
     "token_hext",  # causal_log node (token index) -> kernel hext/1.0 object
     "measured_under",  # trajectory -> policy_set
     "same_content_as",  # trajectory <-> trajectory (same content_id; stored once, a < b)
+    "verification_input",  # verification -> a record it relates (attrs.role: subject_a | subject_b)
 )
 
 
