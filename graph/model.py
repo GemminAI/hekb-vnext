@@ -38,7 +38,7 @@ VERIFICATION_STATUSES: Final = ("VERIFIED", "FAILED", "NOT_EVALUATED", "UNRESOLV
 
 NODE_TYPES: Final = (
     "trajectory", "causal_log", "source_text", "hext_kernel", "policy_set",
-    "raw_log", "hext_document", "verification",
+    "raw_log", "hext_document", "hext_claim", "verification",
 )
 EDGE_TYPES: Final = (
     "has_causal_log",  # trajectory -> causal_log blob (token range)
@@ -47,6 +47,11 @@ EDGE_TYPES: Final = (
     "measured_under",  # trajectory -> policy_set
     "same_content_as",  # trajectory <-> trajectory (same content_id; stored once, a < b)
     "verification_input",  # verification -> a record it relates (attrs.role: subject_a | subject_b)
+    # HEXT v2 projection (a derived, rebuildable layer; see graph/hext_projection.py)
+    "has_claim",  # hext_document -> hext_claim
+    "time_relation",  # hext_claim -> hext_claim (a HEXT relations[] entry)
+    "observation_ref",  # hext_document -> trajectory (only when the reference resolves)
+    "derived_from",  # hext_document -> hext_document (provenance.derived_from, only when the target is present)
 )
 
 

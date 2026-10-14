@@ -72,10 +72,42 @@
 | `R-VER-ID-HEXT10-01` | VERIFIED | 13,077 |
 | `R-VER-REF-RESOLVE-01` | UNRESOLVED | 13,077 |
 
-Verification 記録 26,298 件、グラフ: ノード 39,567・辺 52,596。同じ入力で 2 回作って、ノード・辺のログの連鎖の先頭が一致した。
+Verification 記録 26,298 件、グラフ（本体）: ノード 39,519・辺 52,596。HEXT の射影は別のログ（文書 48・`observation_ref` の辺 48・`unresolved` 0）。同じ入力で 2 回作って、ノード・辺のログの連鎖の先頭が一致した。
 
 ## 7. 未確認
 
 - `hext/1.0` の参照が、ディスク外（VM の稼働中の 8300、他のマシン）にある文書を指す可能性。探索範囲は本書の `search_scope` のとおりで、「存在しない」とは言っていない。
 - Verification を HEKB の API（`PUT/GET`）に載せる形式。本追補は読み取り専用のプロトタイプまで。
 - `GRAPH_SEARCH_v0_1.md` のノードの `verification` 欄との統合（欄を Verification の集約として導出するか）。
+
+## 8. HEXT v2 JSON → グラフの射影 [提案。実装: `graph/hext_projection.py`]
+
+**対象**: HEXT 文書（D-70 の Evidence）と、その `claims`・`relations`・`observation_refs`・`provenance` だけ。**Trajectory・因果ログ・Interpretation・Selection・Outcome を HEXT から作らない。** 射影は導出された（`derived`）層で、HEXT の JSON から**いつでも作り直せる**。Verification など HEXT 由来でない記録は別のログ（本体のグラフ）にあり、射影の作り直しの影響を受けない。
+
+### 8.1 写像表
+
+| HEXT のフィールド | グラフ | ノード ID・属性の導き方 |
+|---|---|---|
+| 文書全体 | ノード `hext_document`（`d70_kind=Evidence`、`epistemic_status`＝導出なら `derived`） | ID ＝ `"hextdoc:" + final_seal.state_hash`。属性: `hext_object_id`（`object.id`）、`state_hash`、`hekb_object_id`（HEKB の `object_id`、あれば）、`blob_sha256`（文書のバイト列の SHA-256）、`validated_level`、`hext_kind`、`object_type`、`lifecycle`、`sealed_at` |
+| `object.id` | 属性 `hext_object_id` | ノード ID には使わない（版が変わっても `state_hash` で区別する） |
+| `final_seal.state_hash` | 属性 `state_hash`、ノード ID の元 | `hextdoc:` ＋ その値 |
+| HEKB の `object_id` | 属性 `hekb_object_id` | **HEXT の `id`・`state_hash` とは別の属性**。ノード ID の元にしない |
+| `time.claims[]` | ノード `hext_claim` ＋ 辺 `has_claim`（文書 → claim） | ID ＝ `"hextclaim:" + state_hash + "#" + time_id`。属性: `time_id`・`frame`・`expression`・`status`・`value`・`event_ref`・`source`（`{evidence_id, start, end}`）・`anchor_ref` |
+| `time.relations[]` | 辺 `time_relation`（claim → claim） | 属性: `rel_id`・`relation`・`offset`・`status`。端点が文書自身または `derived_from` の（射影済みの）元文書の claim でなければ、辺を作らず `unresolved`（`relation_endpoint`） |
+| `provenance.derived_from[]` | 辺 `derived_from`（文書 → 元の文書） | 元の `state_hash` の文書が射影の集合にあるときだけ。無ければ辺を作らず `unresolved`（`derived_from`） |
+| `provenance.contributors`・`agency` | 文書ノードの属性 | ノードにしない |
+| `time.observed_at`・`recorded_at` | 文書ノードの属性 | そのまま（`null` は `null`）。現在時刻で埋めない |
+| `measurement.observation_refs[]` | 辺 `observation_ref`（文書 → 軌跡）。属性: `session_id`・`seq_from`・`seq_to`・`ref` | `urn:gmm:nvs:session:<session_id>#seq=a-b` の `session_id` が、グラフ内の軌跡に解決できるときだけ。**解決できなければ辺を作らず、UNRESOLVED の記録**（規則 `R-VER-OBSREF-RESOLVE-01`）にする |
+| `measurement.space_id`・`calibration`・`causal_log_ref` | 文書ノードの属性 | 辺にしない（`causal_log_ref` は未定義の単位のため属性のみ） |
+| `evidence[]` | 文書ノードの属性 `evidence_ids` | 本文はノードに複製しない（blob で参照） |
+
+### 8.2 辺を作ったことと、意味を検証したことは別
+- 射影が作る辺は「識別子が解決した」ことだけを表す（例: `observation_ref` は、セッション ID が一致した軌跡を指す）。
+- その関係に意味があるか（範囲・`space_id` の一致など）は、**別の Verification 記録**（`R-VER-DOC-TRAJ-01` など）が持つ。辺があることは `VERIFIED` ではない。
+- 作れなかった辺は、射影の `unresolved`（構造の副産物）と、本体のグラフの Verification（`UNRESOLVED`、理由つき）の両方に残る。
+
+### 8.3 決定性と作り直し
+- 射影は、文書のバイト列と 2 つの参照（セッション → 軌跡、元文書の有無）だけの関数。入力の順序に依存しない（`blob_sha256` で整列）。時刻・乱数を使わない。
+- 射影は専用のログ（`graph/hext_projection/{nodes,edges,unresolved}.jsonl`、ハッシュ連鎖）で、作り直しは新しいログを書いて入れ替える。本体のログ（Verification を含む）は変更しない。
+- 試験（`tests/test_hext_projection.py`）: 新しいプロセス 2 回（`PYTHONHASHSEED=0`）で連鎖の先頭が一致／射影を消して入力順を変えて作り直しても一致／本体の Verification が残る／HEXT 由来の型が `hext_document`・`hext_claim` だけ。
+- 実データ（HEXT-V2-GEN001 の 48 件）: 文書ノード 48、`observation_ref` の辺 48（すべて解決）、`unresolved` 0、claims 0（生成した文書は時間の主張を持たない）。claims・relations・`derived_from` の写像は、**テストデータ**（`GemminAI/hext` の P0 の例文書）でのみ確かめた。

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Collection
 from typing import Any
 
 from graph.chainlog import canonical
@@ -43,6 +44,11 @@ RULES: dict[str, dict[str, str]] = {
         "version": "1",
         "text": "hext/1.0 reference identity: cycle_raw.hext.object_id == ports.P01.raw.parent_event_id == "
                 "provenance.cycle_provenance[0].hext_object_id of the same record",
+    },
+    "R-VER-OBSREF-RESOLVE-01": {
+        "version": "1",
+        "text": "a HEXT measurement.observation_refs entry resolves to a stored trajectory (session id found in the "
+                "graph); an unresolved entry creates no edge and is recorded as UNRESOLVED",
     },
     "R-VER-REF-RESOLVE-01": {
         "version": "1",
@@ -88,12 +94,12 @@ def make_verification(
     return {"verification_id": vid, "epistemic_status": "verified_relation", **body}
 
 
-def write_verification(store: GraphStore, ver: dict[str, Any]) -> bool:
+def write_verification(store: GraphStore, ver: dict[str, Any], known_ids: Collection[str] = ()) -> bool:
     """Append the verification as a node and link it to its subjects. Existing nodes are never touched."""
     if ver.get("epistemic_status") != "verified_relation" or "verified_relation" not in EPISTEMIC_STATUSES:
         raise GraphError("a verification record is epistemic_status=verified_relation")
     for sid in (ver["a"], ver["b"]):
-        if sid is not None and not store.has_node(sid):
+        if sid is not None and not store.has_node(sid) and sid not in known_ids:
             raise GraphError(f"subject node {sid!r} does not exist (add it first; verification never creates observations)")
     attrs = {k: v for k, v in ver.items() if k != "verification_id"}
     created = store.add_node(
