@@ -1,6 +1,6 @@
 # EXP-D71-CONTEXT-001 v0.2-A — 段 1（材料と条件の作成）と段 2（Mac での小さな試行）の設計
 
-- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-A rev1`（PROPOSAL。設計のみ。実行・生成・ダウンロードはしていない。変更は末尾の「変更履歴」）
+- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-A rev2`（PROPOSAL。設計のみ。実行・生成・ダウンロードはしていない。変更は末尾の「変更履歴」）
 - **Date:** 2026-10-14
 - **元:** `EXP-D71-CONTEXT-001_v0.1.md`（Tomo がチャットに貼ったもの。原文のまま置いた。sha256 `a33f249d30ba8552d52ae987ae1be94c2f248269e3146a9c690c283349af74d3`）
 - **続き:** 段 3（RunPod）は `EXP-D71-CONTEXT-001_v0.2-B_runpod.md`
@@ -168,8 +168,32 @@
 - **SensOS の MLX プロバイダを通す**（F7）。`~/Projects/sensos` の `InferenceProvider` の型に合わせた **Llama-3.1 用のプロバイダ**（例: `Llama31MLXProvider`）が要る。要件: チャットテンプレート、`temperature`・`top_p`・種、生成したトークン ID と本文、`generate_seconds`・`load_seconds`、`prompt_tokens`・`completion_tokens`、モデルの ID・リビジョン。`GPTOSSProvider` の写しで足りるが、**既存の `generate` 契約は変えない**（追加のみ）。この追加は判断 J4（**確定: A。置き場所は下記**）。
 - **置き場所（J4=A、置き場所は Tomo が変更）**: `Llama31MLXProvider` は **`~/GemminAI/sensos`（GitHub: `GemminAI/sensos`）に追加**し、GitHub に commit してから `~/Projects/sensos` に**入れ直す**。**`~/Projects/sensos` は直接編集しない**。既存の `generate` の契約は変えない（追加のみ）。
   - **実施前に確認が要る点 [FACT・未確認]**: `~/GemminAI/sensos` の `main` には `sensos/core/inference.py`（`InferenceProvider`）も `sensos/core/providers/` も**ない**。`~/Projects/sensos` は別の系統（ブランチ `empty`、`7e29fe5`）で、これらのファイルは**未追跡**（`git ls-files` に無い）、他に未コミットの変更がある。つまり「`InferenceProvider` の型に合わせる」対象が `~/GemminAI/sensos` には存在しない。選択肢: (a) `~/GemminAI/sensos` に、`InferenceProvider`／`InferenceResult` の最小の定義と `Llama31MLXProvider` を**新しいモジュールとして追加**し（既存ファイルは変えない）、`~/Projects/sensos` の同名の型と互換にする、(b) `~/Projects/sensos` の未追跡の `core/` を先に別の手順で GitHub に載せる（本件の範囲外）。推奨は (a)。**入れ直しの前に、`~/Projects/sensos` の未コミットの変更の扱い（退避・照合）を Tomo と決める**。
+  - **現状の保存（読み取りのみ。2026-10-14）**: `experiment-evidence/EXP-D71-CONTEXT-001/stage2/projects_sensos_snapshot/` に、`git status`（通常と porcelain）、追跡ファイルの `git diff`（4 ファイル・118 行追加、各 sha256）、未追跡ファイル 70 件の一覧と各 sha256、未追跡の `sensos/core/` のコピー（18 ファイル）、HEAD とブランチ（`empty`、`7e29fe5`、`origin/empty: ahead 41, behind 3`）を保存した。元のディレクトリは変更していない。コピーは参照用で、移植はしない。
 - **隠れ状態は取らない**。理由: (1) `mlx_lm.generate` は隠れ状態を返さない（ONSET002 B0）。フックで取ることはできても、(2) **MLX の 4bit と CUDA の bf16 では数値が違い**、同じ測定空間にならない（B0: 「different numerics, not the same measurement space」）。段 2 の目的は答えの正誤だけで、因果ログは不要。
 - **結果の記録**: `backend: "mlx-4bit"`、`model_ref: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit@<rev>"`。HEKB の `space_id`（`model_ref`・層・射影…で決まる）とは**無関係の別の空間**として記録し、段 3 の数値と**混ぜない**（集計表に `backend` の列を持たせ、段 3 の対比に段 2 の生成を入れない）。
+
+### 3.2.1 生成条件の対応表（MSD0001 と段 2）
+
+段 2 の結果を読むときの前提。「MSD0001」は凍結タグ `msd0001-v1.1-frozen` の生成（HF、bf16）、「段 2」は `Llama31MLXProvider`（MLX 4bit、`mlx_lm` 0.31.3）。根拠は、MSD 側は `backends.py`・`config.py`・`meta.json`、MLX 側は MLX リポジトリの `config.json`・`tokenizer_config.json` と、`~/Projects/sensos/.venv` の `mlx_lm` のソース。
+
+| 行 | MSD0001（HF bf16） | 段 2（MLX 4bit） | 判定 | 段 2 の結果の読み方への影響 |
+|---|---|---|---|---|
+| モデル重み（rev・精度） | `meta-llama/Llama-3.1-8B-Instruct` rev `0e9e39f2…`、bf16 | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` rev `241a666d…`（2024-11-26）、4bit・group_size 64（重み 4,517,488,999 B）。変換元の Meta の rev は不明（`config.json` の `transformers_version` は 4.42.3） | **不一致** | 量子化の誤差があり、絶対的な正答率は段 3 と比べない。条件間の相対差だけを見る（§3.6） |
+| トークナイザー | rev `0e9e39f2…` の `tokenizer.json`（gated で今回は読めない） | MLX リポジトリの `tokenizer.json`（9,084,449 B） | **未確認** | 同一なら問題なし。違えば文脈のトークン数・入力が違う。取得後に sha256 を、MSD 側の記録がある場合は照合 |
+| チャットテンプレート | `apply_chat_template(add_generation_prompt=True)`（`backends.py`）。rev の `tokenizer_config.json` のテンプレート | MLX 側の `tokenizer_config.json` のテンプレート（4,614 文字、`Today Date` の既定値 `26 Jul 2024`） | **未確認** | 日付行などの差があれば、プロンプトが少し違う。取得後に生成されるプロンプト文字列を保存して、文脈ごとに記録 |
+| システム指示 | `SYSTEM_PROMPT`（秘密のコード付き） | 同じ文字列（J5） | **一致** | ― |
+| ユーザーの出力形式 | `ANSWER:` のみ（`ANSWER_INSTRUCTION`） | `ANSWER:`／`CLARIFY:`（§3.3） | **不一致（設計による）** | 段 2 の応答の形式は MSD0001 のセッションと違う。M2・M5 のため。ライブラリの事例は元の形式のまま渡す（B・C の事例の本文は MSD0001 のもの） |
+| T・top_p・seed の扱い | `T=0.7`、`top_p=0.95`、`torch.manual_seed`（CUDA の乱数） | `T=0.7`、`top_p=0.95`、`mx.random.seed`（MLX の乱数） | **不一致**（値は同じ、実装が別） | 同じ種でも同じ出力にならない。サンプル単位の対応は取れず、分布としての比較のみ |
+| `top_k` | 明示せず。HF の `generate` 既定（`top_k=50`）が効く（transformers 4.48.3: `generation/utils.py` で `top_k` を warper に追加）。rev の `generation_config.json` は gated で未確認 | 指定しない（0＝無効） | **不一致**（MSD 側の実際の値は**未確認**） | 候補の裾の扱いが違う。段 2 の多様性が MSD より少し広い／狭いことがあり得る |
+| 温度と top_p の適用順 | HF: 温度 → top_k → top_p の順（`generation/utils.py` 1058〜1065 行）。top_p は温度後の分布で切る | `mlx_lm`: top_p を**温度の前の**対数確率で切り、その後に温度で `categorical`（`sample_utils.py`） | **不一致** | T=0.7 では HF のほうが核が狭く、MLX は裾の候補が残りやすい。段 2 の出力のばらつきは MSD より大きい側にずれ得る |
+| `max_new_tokens` | 768 | 768 | **一致** | ― |
+| `min_new_tokens` | 128 | 指定しない | **不一致（設計による）** | 短い `CLARIFY:` を許す。MSD0001 の応答長（≥128）とは比べない（長さの比較はしない） |
+| 停止条件（EOS） | `pad_token_id=eos_token_id`。停止は rev の `generation_config.json` の `eos_token_id`（gated で今回は読めない。Llama-3.1 では [128001, 128008, 128009] のはずだが記録は無い） | `mlx_lm` は `config.json` の `eos_token_id`＝[128001, 128008, 128009] を停止集合にする（`utils.py:496`）。`tokenizer.eos_token` は `<|eot_id|>` | **未確認**（MLX 側は確認済み） | 一致していれば応答の終わりは同じ。違えば MSD の応答長・`ANSWER:` 行の到達率が違う。最初の 10 生成で終了理由（EOS／長さ上限）を確認 |
+| サンプラーの実装 | HF の `LogitsProcessor` の列 | `mlx_lm.sample_utils.make_sampler` | **不一致** | 上の 3 行の原因。実装が別なので、同じ設定でも同じ分布ではない |
+| attention の実装 | `attn_implementation` を**指定していない**（`from_pretrained` に引数なし）。transformers 4.48.3 の `_autoset_attn_implementation` は、指定が無ければ torch ≥ 2.1.1 で `sdpa` を選ぶ（`_supports_sdpa=True`）→ **`sdpa` と推定**（`output_attentions` は要求していないので `eager` への退避は起きない）。**実行時の記録は無い** | MLX の融合した attention（`mx.fast.scaled_dot_product_attention`）、4bit の重み | **不一致**（MSD 側は推定） | 数値の差は 4bit の量子化誤差の中に埋もれる。分けて評価できない |
+| バッチ | 1 セッションずつ（バッチ 1。29.4 トークン/秒） | 1 生成ずつ（バッチ 1） | **一致** | ― |
+
+**集計**: 一致 3 行（システム指示、`max_new_tokens`、バッチ）、不一致 8 行（うち設計による 2 行）、未確認 3 行（トークナイザー、チャットテンプレート、停止条件の MSD 側）。**段 2 は MSD0001 と同じ測定条件ではない**。段 2 の値は、段 3 の問題数の概算にしか使わない（§3.6）。
 
 ### 3.3 生成の設定
 
@@ -208,6 +232,14 @@
 ## 4. 止まる条件・成果物の置き場所
 
 **止まる条件**: (1) Locked の ID・ファイルに触れる必要が出た、(2) 既存の `object_id`・blob・MSD0001 のファイルが変わる必要が出た（読み取りのみ）、(3) 漏洩の検査が評価プールの 20% 超を落とした（設計の見直し）、(4) メモリ使用 80% 超、(5) モデルの取得ができない（§3.1）、(6) 本番の VM（8300）・ONSET002 のデータ・事前登録に触れる必要が出た、(7) 採点の語彙を結果を見て変えようとした（変更の記録なしに）。
+
+### 4.1 push の条件と実行の条件（別のものとして扱う）
+
+| | 条件 |
+|---|---|
+| **push の条件**（feature ブランチ。Tomo の OK も要る） | (1) 両文書（v0.2-A・v0.2-B）の sha256 を**実ファイルから再計算**し、報告した値と一致すること。(2) **確認 1（attention）** と **確認 2（層 32）** の結果が文書に反映されていること（§3.2.1 の attention の行、v0.2-B §1・§2・§7）。(3) 作業ツリーが clean（未コミットの変更なし）。main・タグ・PR・force は使わない |
+| **段 2 の実行の条件** | Tomo の OK（モデルの取得とライセンスの確認: J6）、Llama プロバイダの追加の完了（J4 と「実施前に確認が要る点」）、§2.7 の漏洩検査の合格 |
+| **段 3 の実行の条件** | **D71-B0 の実測で合格すること**（v0.2-B §4.1）。**トークン ID の完全一致と、隠れ状態の許容誤差（最大絶対差 ≤ 1e-3）は事前固定のまま評価し、結果を見て基準を変えない**。変えるときは版を上げ、D71 の主実行の前に決め直す |
 
 **置き場所**（`feedback_experiment_evidence_separation`）: コード・仕様・ハーネスは git（`nvs-runtime/examples/d71_*` と `hekb-vnext/docs/design`）。**結果（文脈・生成・採点・集計）は git の外**: `~/vaults/20260124/experiment-evidence/EXP-D71-CONTEXT-001/stage1/`、`.../stage2/`（`README.md`・`selection.json`・`contexts/`・`generations.jsonl`・`scores.json`）。ライブラリの取り込み先は新しい data dir（`/Volumes/SSD1TB/d71_work/`）。
 
@@ -258,6 +290,11 @@
 - **前提**: GRAPH_SEARCH v0.1 に辺の型（`retrieved_for`・`evaluates`・`retry_of` 等）を追加する設計が要る（追加のみ）。v0.2 の結果次第で、本候補は取り下げ・変更され得る。
 
 ## 変更履歴
+
+- **rev2（2026-10-14）**: 追加の指示を反映。
+  - §3.2: `~/Projects/sensos` の現状の保存（読み取りのみ）の結果を追記。
+  - §3.2.1（新設）: 生成条件の対応表（MSD0001 と段 2。一致 3・不一致 8・未確認 3）。確認 1（attention）の結果を反映。
+  - §4.1（新設）: push の条件と実行の条件を分離。
 
 - **rev1（2026-10-14）**: Tomo の確定（J1=B、J2=A、J3=A、J4=A＋置き場所の変更、J5=A、J6=A、J7=A、J8=B）を反映。
   - §2.2・§3.3・§3.4: サンプル数を **2/セル** に統一（生成数 400 → **800**、所要時間 約 1.5〜2.5 時間 → **約 2.5〜3.5 時間**）。

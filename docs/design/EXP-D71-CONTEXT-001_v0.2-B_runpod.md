@@ -1,6 +1,6 @@
 # EXP-D71-CONTEXT-001 v0.2-B — 段 3（RunPod での本番の実行と、因果ログの照合）の設計
 
-- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-B rev1`（PROPOSAL / 事前登録の草案。設計のみ。実行・生成・ポッドの起動はしていない。変更は末尾の「変更履歴」）
+- **Document ID:** `EXP-D71-CONTEXT-001` / **Version:** `0.2-B rev2`（PROPOSAL / 事前登録の草案。設計のみ。実行・生成・ポッドの起動はしていない。変更は末尾の「変更履歴」）
 - **Date:** 2026-10-14
 - **前提:** `EXP-D71-CONTEXT-001_v0.2-A_local.md`（v0.2-A。同じブランチ `docs/graph-search-v0`）。条件 A・B・C・C′・D、項目単位の分割、材料の作り方、漏洩の検査、段 2 の採点規則は v0.2-A に従う。
 - 区分: **[FACT]** 今回確かめた／**[提案]**／**[未確認]**
@@ -33,7 +33,7 @@
 | 項目・条件 | 段 2 の結果で決めた N 項目（段 2 の 40 項目とは重ならない）× {十分版・不足版} × {A・B・C・C′・D} |
 | 反復 | **R = 3 サンプル/セル**（段 3 の値。段 2 は 2 サンプル/セル（J8=B）。軌跡の「分岐」の定義にセル内のばらつきが要る：§3.1。R は段 2 の後に見直し得る） |
 | 種 | `seed = H(版, 項目, サンプル番号)`（条件間で共通）。同じ入力・同じ種で再現されることを D71-B0 で確かめる（§4.1） |
-| **決定性の設定**（生成の前に設定し、設定値を run の記録に残す） | `torch.use_deterministic_algorithms(True)`（`warn_only=False`。非決定的な演算で例外になった場合は**黙って外さず**、止めて報告）。環境変数 `CUBLAS_WORKSPACE_CONFIG=:4096:8`。`torch.backends.cudnn.deterministic=True`、`torch.backends.cudnn.benchmark=False`。TF32 を無効（`torch.backends.cuda.matmul.allow_tf32=False`、`torch.backends.cudnn.allow_tf32=False`）。`torch.manual_seed`・`torch.cuda.manual_seed_all`・`PYTHONHASHSEED` を固定。注意機構の実装（`attn_implementation`）は固定して記録（MSD0001 の値は記録が無く [未確認]、既定の `sdpa` を仮置き） |
+| **決定性の設定**（生成の前に設定し、設定値を run の記録に残す） | `torch.use_deterministic_algorithms(True)`（`warn_only=False`。非決定的な演算で例外になった場合は**黙って外さず**、止めて報告）。環境変数 `CUBLAS_WORKSPACE_CONFIG=:4096:8`。`torch.backends.cudnn.deterministic=True`、`torch.backends.cudnn.benchmark=False`。TF32 を無効（`torch.backends.cuda.matmul.allow_tf32=False`、`torch.backends.cudnn.allow_tf32=False`）。`torch.manual_seed`・`torch.cuda.manual_seed_all`・`PYTHONHASHSEED` を固定。注意機構の実装（`attn_implementation`）は**明示して**固定し記録する。**確認 1（2026-10-14）**: MSD0001 の `HFBackend` は `attn_implementation` を指定していない。transformers 4.48.3（`modeling_utils.py` の `_autoset_attn_implementation`）では指定が無ければ torch ≥ 2.1.1 で `sdpa` が選ばれる（Llama は `_supports_sdpa=True`、`output_attentions` を要求しないので `eager` への退避なし）ので、**MSD0001 は `sdpa` と推定される。ただし生成時の記録は無い**。段 3 は `attn_implementation="sdpa"` を明示する（推定が外れていれば、段 3 の隠れ状態は MSD0001 と数値が少し違い得るため、`space_id` の一致と、同じセッションの再生成との差を D71-B0 の補助として記録する） |
 | **許容誤差**（事前に固定） | 同じ入力・同じ種・同じ Pod・同じ設定で 2 回生成したとき: **トークン ID は完全一致**。層 32 の隠れ状態（float32 保存）は **最大絶対差 ≤ 1e-3**（目標は完全一致。この値は生成の前に固定し、結果を見て変えない。変える場合は版を上げて D71 の主実行の前に決め直す）。ポート値は、同じトークン ID・同じ隠れ状態からの再取り込みで完全一致（冪等性） |
 | 実行順 | 項目と条件を**ブロックでランダム化**（項目内で条件の順を乱数で並べ、ポッドの時間による系統的な差を避ける）。順序の乱数の種を記録 |
 | 文脈 | v0.2-A で作った文脈（ハッシュ固定）。**ポッドの上で文脈を作り直さない**（取り込みの前に Mac で固定し、sha256 を照合してから渡す） |
@@ -45,7 +45,7 @@
 | 区分 | 項目 |
 |---|---|
 | 出力 | トークン ID の列、生成テキスト（トークナイザー整形後と、バイト正確な復号の両方）、`finish_reason`（EOS／長さ上限）、`n_tokens` |
-| 隠れ状態 | **Edge が使う層（32）の隠れ状態**（float32、`[T, 4096]`）。`hidden_sha256`、形、dtype。**他の層は保存しない**（K2=A。nvs-runtime が単層の配列を受け付けない場合の扱いは §7 の未確認） |
+| 隠れ状態 | **Edge が使う層（32）の隠れ状態**（float32。1 トークンは 4096 次元。保存形式は `[T, 1, 4096]`、確認 2 参照）。`hidden_sha256`、形、dtype。**他の層は保存しない**（K2=A）。**確認 2（2026-10-14）**: nvs-runtime の `HiddenStateReplayProvider` は `hidden[token_index, layer_index, :]` を読む（`providers/replay.py:120`）ので、**2 次元 `[T, 4096]` は受け付けない**。**`[T, 1, 4096]`（float32）で保存し、`layer_index=0` を指定する**とコード変更なしで受け付ける（コンストラクタの引数。AUDIT004 の `examples/audit004_runs.py:179` に先例）。manifest は `sessions.<id> = {split, bytes, sha256, shape, dtype}` で、配置は `hidden/<session_id>/hidden.npy`。この経路の実測は D71-B0 の前の取り込みの試験で行う（本書では未実行）。`space.layer = 32` は `run_session(layer=32)` の引数で別に与える |
 | 確率 | 選ばれたトークンの対数確率、エントロピー（MSD と同じ。段階の記述に使う） |
 | 時刻 | 生成の開始・終了（UTC と JST、単調時計の経過秒）、プリフィルとデコードの秒。**Edge の事象時刻（`event-time-v1`、1 トークン 1 秒）は合成の時刻**で、実時刻と別の欄 |
 | 環境 | モデルの rev・torch・transformers・CUDA・ドライバ・dtype、**GPU の機種**（`nvidia-smi`）、**Pod ID**（環境変数 `RUNPOD_POD_ID`）、ホスト名、リージョン、ハーネスの git コミット、本書の版と sha256 |
@@ -125,6 +125,8 @@
 | 4 | **ONSET002 段階 B**（分岐点の再サンプリング） | ONSET002 | 1b 合格 |
 | 5 | 実験ごとに sha256 の一覧を作り、持ち帰る。Pod を Tomo が終了する | 共通 | §5 |
 
+**実行の条件（再掲）**: D71 の主実行（# 3）の条件は **D71-B0 の実測で合格すること**。**トークン ID の完全一致と、隠れ状態の許容誤差（最大絶対差 ≤ 1e-3）は §1 のとおり事前固定のまま評価し、結果を見て基準を変えない**（変えるときは版を上げ、主実行の前に決め直す）。push の条件（両文書の sha256 の再計算、確認 1・確認 2 の反映）は実行の条件とは別（v0.2-A §4.1）。
+
 **成果物・止まる条件・報告は実験ごとに分ける**:
 
 | 項目 | D71 | ONSET002 |
@@ -166,7 +168,7 @@ D71 を先にするのは、小さく、結果が早く分かり、ONSET002 の�
 
 **確定**: K1=A（同じ Pod を共用。**開始・停止の条件は実験ごとに分ける**: §4.1）、K2=A（層 32 のみ）、K3=A（`min_new_tokens` を外す）、K4=A（A100 80GB 以上）、K5=A（逸脱の基準は同じ実行の条件 A の正答生成を主）、K6=段 2 の後に N を決める、K7=A（「分岐」は条件間の文脈による分かれ。接頭辞を固定する型は別の実験）。表は選択肢の記録。
 
-**未確定・要確認**: 層 32 のみの配列を nvs-runtime が受け付けるか（受け付けなければ D71 だけ 8 層に戻すか、取り込み側を直すかを Tomo と決める）。
+**確認済み（確認 2）**: 層 32 のみの保存は `[T, 1, 4096]`＋`layer_index=0` で受け付けられる（§2。実測は取り込みの試験で）。
 
 | # | 決める点 | 選択肢 | 推奨 |
 |---|---|---|---|
@@ -182,13 +184,19 @@ D71 を先にするのは、小さく、結果が早く分かり、ONSET002 の�
 
 - ONSET002-PREP の中身（G5。生成コード・状態の複製・見積もり）。ONSET002 段階 A の `stageA_results.json` と事前登録 rev 1 から概算した。
 - バッチ生成（R=3、N=10）で `output_hidden_states` を保存したときの GPU のスループット（§4.2 は 5〜10 倍の仮定）。バッチと 1 本ずつで隠れ状態が（数値として）一致するかも確認が要る（不一致なら 1 本ずつ）。
-- nvs-runtime が層 32 のみの配列を受け付けるか（K2）。
+- `[T, 1, 4096]`＋`layer_index=0` の取り込みを実際に通した結果（コードからの読みと AUDIT004 の先例のみ。K2）。
 - 条件 A・B・C・C′・D のプロンプト長の違いが、隠れ状態の分布（V・S）に及ぼす影響。比べるのは**生成トークンの位置**で、文脈は軌跡に入らないが、注意の経路で影響する。C−C′ は長さを揃えてあるので、この影響を消さずに差し引く設計。
 - RunPod の現在の価格・在庫。
 - 段 2 の結果（N、δ_M）と、それによる本書の版の更新。
 - 「分岐」の BUNDLE001 の定義との整合（本書は操作的な定義。BUNDLE001 の束の語は未照合）。
 
 ## 変更履歴
+
+- **rev2（2026-10-14）**: 追加の指示を反映。
+  - §1: 確認 1（attention: `sdpa` と推定、記録なし。段 3 は明示）。
+  - §2: 確認 2（層 32 は `[T,1,4096]`＋`layer_index=0`。2 次元は不可）。
+  - §4.1: 段 3 の実行の条件（D71-B0 の実測。基準は事前固定のまま）と push の条件の分離。
+  - §6: 確認 2 の反映。
 
 - **rev1（2026-10-14）**: Tomo の確定（K1=A〜K7=A、K6＝段 2 の後）を反映。
   - §4.1: 共通の 0 の後で**ゲートを実験ごとに分けた**（D71-B0＝通常の生成の再現性: トークン ID の完全一致・隠れ状態は許容誤差以内、ONSET002-B0＝接頭辞からの続きの生成）。ONSET002-B0 の不合格は D71 を止めない。成果物・止まる条件・報告を実験ごとの表に分離。
