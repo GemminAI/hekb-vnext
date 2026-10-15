@@ -276,9 +276,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
                                            seed=d["seed"])
                 runs.append({"token_ids": r.token_ids, "hidden": provider.last_hidden, "ok": r.failure_kind
                              not in ("generate_failed", "load_failed"), "error": r.error,
-                             "warnings": provider.last_warnings})
+                             "warnings": provider.last_warnings, "seconds": r.generate_seconds,
+                             "n_tokens": len(r.token_ids)})
             results.append({"idx": d["idx"], "prompt_id": d["prompt_id"], **compare_runs(*runs),
-                            "warnings": [x["warnings"] for x in runs]})
+                            "warnings": [x["warnings"] for x in runs],
+                            "seconds": [x["seconds"] for x in runs], "n_tokens": [x["n_tokens"] for x in runs]})
         verdict = all(x["pass"] for x in results)
         env["determinism_warnings"] = [{"idx": x["idx"], "runs": x["warnings"]} for x in results]
         (a.out / "run_env.json").write_text(json.dumps(env, indent=1))
