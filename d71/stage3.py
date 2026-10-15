@@ -190,7 +190,9 @@ def run_generations(
         if r.failure_kind in ("generate_failed", "load_failed"):
             print("STOP:", r.failure_kind, r.error, flush=True)  # includes non-deterministic-op errors
             return 4
-        consecutive_fail = consecutive_fail + 1 if not r.ok else 0
+        # a generation failure (generate_failed / load_failed handled above; eos_missing here). length_limit is a
+        # valid model output (v0.2-A scoring), not a failure row (Tomo, 2026-10-16: "generate_failed が 3 連続").
+        consecutive_fail = consecutive_fail + 1 if r.failure_kind == "eos_missing" else 0
         if consecutive_fail >= CONSECUTIVE_FAIL_LIMIT:
             print(f"STOP: {consecutive_fail} consecutive failed rows", flush=True)
             return 5

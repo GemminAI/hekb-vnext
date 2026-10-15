@@ -86,10 +86,18 @@ def test_run_resume_and_stop_on_failure(tmp_path: Path) -> None:
     assert n == len(design) and (tmp_path / "hidden" / "000000.npy").exists()
     assert stage3.run_generations(design, p, tmp_path, "sys") == 0  # resume: nothing re-run
     assert len((tmp_path / "generations.jsonl").read_text().splitlines()) == n
-    bad = _provider([5, 6])  # no EOS -> length_limit rows (ok False)
+    bad = _provider([5, 6])  # no EOS, 2 tokens < max -> eos_missing rows
     more = stage3.build_design(["a"], ctx, conds=("A",), samples=stage3.SAMPLES)
     code = stage3.run_generations(more, bad, tmp_path / "bad", "sys")
-    assert code == 5  # 3 consecutive failed rows
+    assert code == 5  # 3 consecutive eos_missing rows
+    long_ = _provider([5, 6, 7])  # hits max_tokens=3 -> length_limit rows must NOT stop the run
+    import d71.stage3 as st
+
+    st.MAX_TOKENS = 3
+    try:
+        assert st.run_generations(more, long_, tmp_path / "long", "sys") == 0
+    finally:
+        st.MAX_TOKENS = 768
 
 
 def test_memory_stop(tmp_path: Path) -> None:
