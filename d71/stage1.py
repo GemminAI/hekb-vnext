@@ -42,6 +42,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=EVID / "EXP-D71-CONTEXT-001/stage1")
     ap.add_argument("--skip-ingest", action="store_true")
+    ap.add_argument("--emit-all-contexts", action="store_true",
+                    help="stage 3: also write context_set.json for every built item to <out>/contexts_all/")
     args = ap.parse_args()
     out: Path = args.out
     import shutil
@@ -261,6 +263,16 @@ def main() -> int:
             "system_prompt_sha256": sha(system_prompt), "sufficient_body": items[p]["sufficient_body"],
             "deficient": items[p]["deficient"], "expected": items[p]["expected"], **built[p],
         }, indent=1))
+
+    if args.emit_all_contexts:
+        for p, b in built.items():
+            d = out / "contexts_all" / p
+            d.mkdir(exist_ok=True, parents=True)
+            (d / "context_set.json").write_text(json.dumps({
+                "prompt_id": p, "kind": items[p]["kind"], "difficulty": items[p]["difficulty"],
+                "system_prompt_sha256": sha(system_prompt), "sufficient_body": items[p]["sufficient_body"],
+                "deficient": items[p]["deficient"], "expected": items[p]["expected"], **b,
+            }, indent=1))
 
     # ---- 7. statistics ------------------------------------------------------------------------
     import statistics
