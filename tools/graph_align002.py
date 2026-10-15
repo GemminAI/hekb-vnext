@@ -41,7 +41,15 @@ def sha_file(p: Path) -> str:
     return h.hexdigest()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--graph-out", type=Path, default=G1 / "graph_data_v2")
+    ap.add_argument("--records-out", type=Path, default=G1 / "phase2_alignments_v2.jsonl")
+    ap.add_argument("--report-out", type=Path, default=G1 / "phase2_connection_report.json")
+    ap.add_argument("--no-freeze", action="store_true", help="do not (re)write phase2_freeze_manifest.json")
+    args = ap.parse_args(argv)
     # ---- 1. freeze manifest -----------------------------------------------------------------------------
     files = sorted(
         [p for p in A2.glob("*") if p.is_file()]
@@ -52,7 +60,8 @@ def main() -> int:
     manifest = {"note": "sha256 of the artifacts the Phase 2 connection checks and the v2 extension were built on; "
                         "nothing listed here was modified",
                 "files": {str(p.relative_to(EV)): sha_file(p) for p in files}}
-    (G1 / "phase2_freeze_manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    if not args.no_freeze:
+        (G1 / "phase2_freeze_manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
 
     # ---- inputs -----------------------------------------------------------------------------------------
     layer = HextProjectionLayer(G1 / "graph_data")
@@ -73,7 +82,7 @@ def main() -> int:
             ver_resolve[(v["detail"]["session"], v["detail"]["token_index"])] = v
 
     # ---- 3. containment verifications into a COPY of the graph ------------------------------------------
-    v2dir = G1 / "graph_data_v2"
+    v2dir = args.graph_out
     if v2dir.exists():
         shutil.rmtree(v2dir)
     shutil.copytree(G1 / "graph_data", v2dir)
@@ -93,7 +102,7 @@ def main() -> int:
     store.sync()
 
     # ---- 4. v2 token records and the diff -----------------------------------------------------------------
-    out_path = G1 / "phase2_alignments_v2.jsonl"
+    out_path = args.records_out
     n = 0
     diffs: list[dict[str, Any]] = []
     cover: Counter[int] = Counter()
@@ -141,11 +150,11 @@ def main() -> int:
                      "heads": {"nodes": store.nodes_log.head, "edges": store.edges_log.head}},
         "v2_records_sha256": sha_file(out_path),
     }
-    (G1 / "phase2_connection_report.json").write_text(json.dumps(report, indent=1, sort_keys=True))
+    args.report_out.write_text(json.dumps(report, indent=1, sort_keys=True))
     print(json.dumps({k: report[k] for k in ("token_records", "diff_vs_v1_unexpected", "status_unchanged",
                                              "tokens_by_number_of_containing_documents", "containment_verifications")}, indent=1))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
