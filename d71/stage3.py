@@ -201,6 +201,54 @@ def run_generations(
     return 0
 
 
+RESAMPLE_EVERY = 50
+
+
+def run_resample(
+    design: list[dict[str, Any]], provider: Any, out: Path, system_prompt: str, *, every: int = RESAMPLE_EVERY
+) -> dict[str, Any]:
+    """Second generation, same input and seed, for every design row with idx % every == 0 (fixed rule, see
+    stage3_plan/resample_rule.md). Mismatches never stop the run; they are recorded. Not part of N or R."""
+    import numpy as np
+
+    first = {}
+    for ln in (out / "generations.jsonl").read_text().splitlines():
+        if ln.strip():
+            row = json.loads(ln)
+            first[row["idx"]] = row
+    path = out / "resample.jsonl"
+    done = {json.loads(ln)["idx"] for ln in path.read_text().splitlines() if ln.strip()} if path.exists() else set()
+    n = mismatch = 0
+    bad: list[int] = []
+    for d in design:
+        if d["idx"] % every or d["idx"] in done or d["idx"] not in first:
+            continue
+        r = provider.generate_chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": d["user"]}],
+            max_tokens=MAX_TOKENS, temperature=0.7, top_k=50, top_p=0.95, seed=d["seed"],
+        )
+        orig = first[d["idx"]]
+        ok_run = r.failure_kind not in ("generate_failed", "load_failed")
+        same = bool(ok_run and r.token_ids == orig["token_ids"])
+        diff = None
+        if ok_run and provider.last_hidden is not None and orig.get("hidden_file"):
+            h0 = np.load(out / orig["hidden_file"])
+            if h0.shape == provider.last_hidden.shape:
+                diff = float(np.max(np.abs(h0 - provider.last_hidden)))
+        rec = {"idx": d["idx"], "prompt_id": d["prompt_id"], "cond": d["cond"], "version": d["version"],
+               "sample": d["sample"], "token_ids_identical": same, "n_first": len(orig["token_ids"]),
+               "n_second": len(r.token_ids), "hidden_max_abs_diff": diff, "error": r.error,
+               "warnings": provider.last_warnings, "seconds": r.generate_seconds}
+        with path.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        n += 1
+        if not same:
+            mismatch += 1
+            bad.append(d["idx"])
+    summary = {"every": every, "n_new": n, "mismatches_new": mismatch, "mismatch_idx": bad}
+    return summary
+
+
 def write_manifest(out: Path) -> dict[str, Any]:
     files = {}
     for p in sorted(out.rglob("*")):
@@ -214,7 +262,7 @@ def write_manifest(out: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI over tested functions
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["select", "b0", "calibrate", "main", "manifest"])
+    ap.add_argument("mode", choices=["select", "b0", "calibrate", "main", "resample", "manifest"])
     ap.add_argument("--contexts", type=Path, help="contexts_all directory (Mac-built, sha256-checked)")
     ap.add_argument("--selection", type=Path)
     ap.add_argument("--stage2-selection", type=Path)
@@ -246,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
 
     settings = hf_provider.deterministic_torch(torch)
     sel = json.loads(a.selection.read_text())
-    ids = {"b0": sel["b0"], "calibrate": sel["calibration"], "main": sel["main"]}[a.mode]
+    ids = {"b0": sel["b0"], "calibrate": sel["calibration"], "main": sel["main"], "resample": sel["main"]}[a.mode]
     ctx = load_contexts(a.contexts, ids)
     for p in ids:  # selection.json pins the sha256 recorded on the Mac
         for k, c in ctx[p]["conditions"].items():
@@ -290,6 +338,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
         return 0 if verdict else 8
     conds = ("A",) if a.mode == "calibrate" else CONDS
     design = build_design(ids, ctx, conds=conds, samples=SAMPLES)
+    if a.mode == "resample":
+        summ = run_resample(design, provider, a.out, system_prompt)
+        (a.out / "resample_summary.json").write_text(json.dumps(summ, indent=1))
+        print("RESAMPLE", json.dumps(summ))
+        return 0
     if a.limit:
         design = design[: a.limit]
     (a.out / "design.json").write_text(json.dumps([{k: v for k, v in d.items() if k != "user"} for d in design]))

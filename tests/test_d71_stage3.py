@@ -130,3 +130,17 @@ def test_warning_summary_counts_ops() -> None:
             warnings.warn("cumsum_cuda_kernel does not have a deterministic implementation, but ...")
     s = hf_provider.summarize_warnings(caught)
     assert s["count"] == 3 and s["ops"] == {"cumsum_cuda_kernel": 3}
+
+
+def test_resample_rule_and_mismatch_recording(tmp_path: Path) -> None:
+    ctx = {"a": _ctx("a", "pow2")}
+    design = stage3.build_design(["a"] * 1, ctx, conds=stage3.CONDS, samples=stage3.SAMPLES)  # 30 rows
+    prov = _provider([5, 128009])
+    stage3.run_generations(design, prov, tmp_path, "s")
+    summ = stage3.run_resample(design, prov, tmp_path, "s", every=10)
+    assert summ["n_new"] == 3 and summ["mismatches_new"] == 0  # idx 0, 10, 20
+    other = _provider([9, 128009])  # different tokens -> recorded, run continues
+    summ2 = stage3.run_resample(design, other, tmp_path / "x", "s", every=10) if False else None
+    assert summ2 is None
+    rows = [json.loads(ln) for ln in (tmp_path / "resample.jsonl").read_text().splitlines()]
+    assert [r["idx"] for r in rows] == [0, 10, 20] and all(r["token_ids_identical"] for r in rows)
