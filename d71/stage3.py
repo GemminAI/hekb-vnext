@@ -256,7 +256,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "run_env.json").write_text(json.dumps(env, indent=1))
     if a.mode == "b0":
-        design = build_design(ids, ctx, conds=("A", "C"), samples=(0,))[: N_B0 * 2]
+        first: dict[str, dict[str, Any]] = {}
+        for d0 in build_design(ids, ctx, conds=("A", "C"), samples=(0,)):
+            first.setdefault(d0["prompt_id"], d0)  # one generation per B0 item (5), each run twice
+        design = list(first.values())
         results = []
         for d in design:
             runs = []
