@@ -21,7 +21,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from graph.rebuild_check import CRITERIA, SCHEMA, compare, digest_of, digests  # noqa: E402
+from graph.rebuild_check import CRITERIA, SCHEMA, bind_baseline, compare, digest_of, digests  # noqa: E402
 from graph.verification import RULES, rule_ref  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -95,5 +95,32 @@ def check() -> int:
     return 0 if res["verdict"] == "REBUILD_EQUAL" else 1
 
 
+def rebind() -> int:
+    """rebind <remote_commit> <original_commit> <out.json> [<clone_check.json>]: bind a copy of the baseline to a
+    commit that exists on the remote (the original baseline file is left as it is)."""
+    remote, original, out = sys.argv[2], sys.argv[3], Path(sys.argv[4])
+    clone = json.loads(Path(sys.argv[5]).read_text()) if len(sys.argv) > 5 else None
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True, check=True).stdout
+
+    base = json.loads(BASELINE.read_text())
+    if base["build"]["git_commit"] != git("rev-parse", original).strip():
+        raise SystemExit("the baseline was not recorded at the given original commit")
+    # graph-work commits of each side, paired by subject (cherry-picks keep the subject)
+    upstream = git("merge-base", original, remote).strip()
+    def pairs(rng: str) -> list[list[str]]:
+        return [row.split(" ", 1) for row in git("log", "--reverse", "--format=%H %s", rng).splitlines()]
+
+    local, rem = pairs(f"{upstream}..{original}"), pairs(f"{upstream}..{remote}")
+    by_subject = {s: h for h, s in rem}
+    mapping = [{"original": h, "remote": by_subject[s], "subject": s} for h, s in local if s in by_subject]
+    tree = sorted(git("diff", "--name-only", original, remote).splitlines())
+    out.write_text(json.dumps(bind_baseline(base, remote_commit=git("rev-parse", remote).strip(), mapping=mapping,
+                                            tree_difference=tree, verified_in_clone=clone), indent=1, sort_keys=True))
+    print("bound:", len(mapping), "commits mapped;", len(tree), "files differ:", tree)
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit({"record": record, "check": check}[sys.argv[1]]())
+    raise SystemExit({"record": record, "check": check, "rebind": rebind}[sys.argv[1]]())

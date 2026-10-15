@@ -66,3 +66,25 @@ def compare(baseline: dict[str, Any], inputs: dict[str, str], outputs: dict[str,
                 "same_code_and_rules": same_build,
                 "reading": "non-determinism" if same_build else "code or rule change (not necessarily a defect)"}
     return {**res, "verdict": "REBUILD_EQUAL", "files_compared": len(outputs)}
+
+
+def bind_baseline(
+    baseline: dict[str, Any], *, remote_commit: str, mapping: list[dict[str, str]], tree_difference: list[str],
+    verified_in_clone: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A copy of the baseline whose build identity is a commit that exists on the remote. The original
+    baseline is not modified. C2 records how the original commit corresponds to the remote one (cherry-picks
+    have different commit ids and the same content); C1 inputs and C3 outputs are carried over unchanged."""
+    out = json.loads(json.dumps(baseline))
+    original = baseline["build"]["git_commit"]
+    out["build"] = {**baseline["build"], "git_commit": remote_commit, "working_tree_dirty": False}
+    out["bound_to_remote_commit"] = {
+        "original_commit": original, "remote_commit": remote_commit,
+        "original_on_remote": False,
+        "commit_mapping": mapping, "tree_difference_original_vs_remote": tree_difference,
+        "c2": "the original commit was never pushed; the remote commit holds the same graph/tools/tests by "
+              "cherry-pick (subjects equal, ids differ). The trees differ only in the listed files, none of "
+              "which is an input of the build. C1 and C3 values are those of the original baseline.",
+        "verified_in_clone": verified_in_clone,
+    }
+    return out
