@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -40,14 +42,20 @@ def deterministic_env() -> None:
     os.environ.setdefault("PYTHONHASHSEED", "0")
 
 
-def deterministic_torch(torch: Any) -> dict[str, Any]:
-    torch.use_deterministic_algorithms(True, warn_only=False)
+#: Tomo's decision (a), 2026-10-15, taken AFTER D71-B0 failed with ``warn_only=False`` (cumsum has no
+#: deterministic CUDA kernel). v0.2-B 1 had ``warn_only=False``. Warnings are counted, never dropped.
+WARN_ONLY = True
+_OP_RE = re.compile(r"(\w+) does not have a deterministic implementation")
+
+
+def deterministic_torch(torch: Any, *, warn_only: bool = WARN_ONLY) -> dict[str, Any]:
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     return {
-        "use_deterministic_algorithms": True, "warn_only": False, "cudnn_deterministic": True,
+        "use_deterministic_algorithms": True, "warn_only": warn_only, "cudnn_deterministic": True,
         "cudnn_benchmark": False, "allow_tf32": False,
         "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED"),
@@ -63,6 +71,19 @@ def _frozen_backend(model_id: str, revision: str) -> Any:  # pragma: no cover - 
     from msd.backends import HFBackend  # type: ignore[import-not-found]
 
     return HFBackend(model_id=model_id, revision=revision, layers=(LAYER,), device="cuda", dtype="bfloat16")
+
+
+def summarize_warnings(caught: list[Any]) -> dict[str, Any]:
+    ops: dict[str, int] = {}
+    msgs: list[str] = []
+    for w in caught:
+        text = str(w.message)
+        m = _OP_RE.search(text)
+        if m:
+            ops[m.group(1)] = ops.get(m.group(1), 0) + 1
+        if len(msgs) < 3:
+            msgs.append(text[:200])
+    return {"count": len(caught), "ops": ops, "messages": msgs}
 
 
 class Llama31HFProvider:
@@ -84,6 +105,7 @@ class Llama31HFProvider:
         self.last_hidden: np.ndarray | None = None  # [T, 1, 4096] float32 (layer 32), see v0.2-B 2
         self.last_logprob: np.ndarray | None = None
         self.last_entropy: np.ndarray | None = None
+        self.last_warnings: dict[str, Any] = {"count": 0, "ops": {}, "messages": []}
 
     def _ensure_loaded(self) -> None:
         if self._backend is not None:
@@ -152,9 +174,12 @@ class Llama31HFProvider:
             return InferenceResult(ok=False, text="", error="no EOS token ids", failure_kind=EOS_MISSING, **base)
         try:
             t0 = time.perf_counter()
-            out = self._backend.generate(messages, seed=seed, max_new_tokens=max_tokens, min_new_tokens=0)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")  # count every occurrence
+                out = self._backend.generate(messages, seed=seed, max_new_tokens=max_tokens, min_new_tokens=0)
             seconds = time.perf_counter() - t0
-        except Exception as exc:  # includes a non-deterministic-op RuntimeError: the runner stops on it
+            self.last_warnings = summarize_warnings(caught)
+        except Exception as exc:  # a generation failure; the runner stops on it
             return InferenceResult(ok=False, text="", error=str(exc), failure_kind=GENERATE_FAILED, **base)
         ids = [int(i) for i in np.asarray(out.ids).tolist()]
         finish: str | None = None

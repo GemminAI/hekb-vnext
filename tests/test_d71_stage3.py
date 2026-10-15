@@ -111,3 +111,22 @@ def test_manifest(tmp_path: Path) -> None:
     (tmp_path / "x.txt").write_text("a")
     m = stage3.write_manifest(tmp_path)
     assert m["n_files"] == 1 and json.loads((tmp_path / "manifest.json").read_text())["n_files"] == 1
+
+
+def test_failed_generation_is_fail_not_match() -> None:
+    h = np.zeros((2, 1, 4), np.float32)
+    failed = {"token_ids": [], "hidden": None, "ok": False, "error": "boom"}
+    r = stage3.compare_runs(failed, dict(failed))
+    assert not r["pass"] and r["reason"] == "generation_failed"
+    assert not stage3.compare_runs({"token_ids": [], "hidden": h}, {"token_ids": [], "hidden": h})["pass"]
+
+
+def test_warning_summary_counts_ops() -> None:
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            warnings.warn("cumsum_cuda_kernel does not have a deterministic implementation, but ...")
+    s = hf_provider.summarize_warnings(caught)
+    assert s["count"] == 3 and s["ops"] == {"cumsum_cuda_kernel": 3}

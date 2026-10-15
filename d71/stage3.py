@@ -102,6 +102,11 @@ def load_contexts(root: Path, ids: list[str]) -> dict[str, dict[str, Any]]:
 def compare_runs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
 
+    for run in (a, b):  # a failed generation is a FAIL, never an (empty == empty) match
+        if run.get("ok") is False or not run["token_ids"] or run["hidden"] is None:
+            return {"token_ids_identical": False, "hidden_max_abs_diff": None, "pass": False,
+                    "reason": "generation_failed", "error": run.get("error")}
+
     same_ids = a["token_ids"] == b["token_ids"]
     diff: float | None = None
     if a["hidden"] is not None and b["hidden"] is not None and a["hidden"].shape == b["hidden"].shape:
@@ -269,9 +274,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
                 r = provider.generate_chat([{"role": "system", "content": system_prompt},
                                             {"role": "user", "content": d["user"]}], max_tokens=MAX_TOKENS,
                                            seed=d["seed"])
-                runs.append({"token_ids": r.token_ids, "hidden": provider.last_hidden})
-            results.append({"idx": d["idx"], "prompt_id": d["prompt_id"], **compare_runs(*runs)})
+                runs.append({"token_ids": r.token_ids, "hidden": provider.last_hidden, "ok": r.failure_kind
+                             not in ("generate_failed", "load_failed"), "error": r.error,
+                             "warnings": provider.last_warnings})
+            results.append({"idx": d["idx"], "prompt_id": d["prompt_id"], **compare_runs(*runs),
+                            "warnings": [x["warnings"] for x in runs]})
         verdict = all(x["pass"] for x in results)
+        env["determinism_warnings"] = [{"idx": x["idx"], "runs": x["warnings"]} for x in results]
+        (a.out / "run_env.json").write_text(json.dumps(env, indent=1))
         (a.out / "b0_result.json").write_text(json.dumps({"pass": verdict, "tolerance": HIDDEN_TOL,
                                                           "results": results}, indent=1))
         print("D71-B0", "PASS" if verdict else "FAIL")
