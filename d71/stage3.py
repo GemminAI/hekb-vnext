@@ -126,6 +126,8 @@ def environment(provider: Any) -> dict[str, Any]:  # pragma: no cover - Pod only
         "nvidia_smi": run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]),
         "harness_commit": run(["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"]),
         "backend": provider.describe(),
+        "attn_implementation": getattr(getattr(getattr(provider._backend, "model", None), "config", None),
+                                       "_attn_implementation", None),
     }
 
 
