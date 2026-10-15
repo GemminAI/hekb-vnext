@@ -180,3 +180,30 @@ Verification 記録 26,298 件、グラフ（本体）: ノード 39,519・辺 5
 - v2 の対応表 13,077 件。v1 との差は、宣言した変更（改名・追加・`alignment_id`）だけ。意図しない差 0、`identity`・`temporal`・`semantic` の状態は 13,077/13,077 で不変。
 - 13,077 トークンのすべてが、ちょうど 1 つの文書に含まれる（範囲 0..n_steps−1）。範囲の Verification は 48 件が `VERIFIED`。
 - 2 回の実行で、v2 の記録の SHA-256 と接続レポートが一致した。拡張したグラフは別ディレクトリ（`graph_data_v2/`）で、元の `graph_data/` は不変。
+
+## 12. `graph_data_v2/` は生成物：再構築と、前後の比較基準 [FACT／提案。実装: `graph/rebuild_check.py`、`tools/graph_v2_rebuild.py`]
+
+**位置づけ**: `graph_data_v2/`（と `phase2_alignments_v2.jsonl`・`phase2_connection_report.json`）は、`tools/graph_align002.py` が入力から作る**生成物**。正本ではなく、削除して作り直せる（元の `graph_data/` は変更しない）。
+
+**ベースライン**（`GRAPH-ALIGN001/graph_data_v2_baseline.json`）: 入力 56 ファイルと出力 7 ファイルの SHA-256、ノード・辺の連鎖の先頭、件数、ビルドの同一性（ツールの git commit、規則の SHA-256、Python、`PYTHONHASHSEED`）を記録した。
+
+**比較基準**
+
+| 基準 | 内容 | 必須 |
+|---|---|---|
+| C1 入力 | 入力ファイルの SHA-256 がベースラインと一致（`graph_data` のログと射影、`CAUSAL-ALIGN002/phase2_new_alignments.jsonl`、`verifications.jsonl`、HEXT-V2-GEN001 の対応表と文書） | 必須 |
+| C2 ビルドの同一性 | 記録する。一致は要求しない。C3 の差の説明にだけ使う | 記録 |
+| C3 出力 | 出力ファイルの集合と、各ファイルの SHA-256 が一致。バイトの一致は、連鎖の先頭・件数・全レコードの一致を含意する | 必須 |
+| C4 不変条件 | `graph_data_v2` のログが、元の `graph_data` のログを変更せずに先頭に持つ（追記のみ）／v2 の記録の v1 との差が宣言した改名・追加だけ／全トークンがちょうど 1 つの文書に含まれる | 必須 |
+
+**判定**
+| 判定 | 意味 |
+|---|---|
+| `REBUILD_EQUAL` | C1・C3 が成立（出力がバイト一致） |
+| `INPUTS_CHANGED` | 入力が違う。出力については何も主張しない（変更された入力を列挙） |
+| `OUTPUT_DIFFERS` | 入力は同じで出力が違う。ビルドの同一性（commit・規則）が同じなら非決定性、違えば「コードまたは規則の変更」と読む（欠陥とは限らない） |
+| `OUTPUT_FILES_MISMATCH` | 出力ファイルの集合が違う |
+
+**手順**: 再構築は、既存の生成物を上書きせず、別の作業ディレクトリに作って比較し、作業ディレクトリは削除する（`tools/graph_v2_rebuild.py check`）。
+
+**結果**: 判定 `REBUILD_EQUAL`（出力 7 ファイルがバイト一致）。確認の前後で既存の生成物は不変（`artifact_untouched: true`）。`GRAPH-ALIGN001/graph_data_v2_rebuild_check.json` に記録した。比較器の判定（入力変化・出力差・ファイル集合の不一致・ビルドの区別）は `tests/test_rebuild_check.py` の 6 件で検査している。
