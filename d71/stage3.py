@@ -145,7 +145,7 @@ def gpu_mem_fraction() -> float:  # pragma: no cover - Pod only
 
 def run_generations(
     design: list[dict[str, Any]], provider: Any, out: Path, system_prompt: str,
-    *, mem_fraction: Any = lambda: 0.0, save_hidden: bool = True,
+    *, mem_fraction: Any = lambda: 0.0, save_hidden: bool = True, row_extra: Any = None,
 ) -> int:
     import numpy as np
 
@@ -185,6 +185,8 @@ def run_generations(
             "logprob_chosen": provider.last_logprob.tolist() if provider.last_logprob is not None else None,
             "entropy": provider.last_entropy.tolist() if provider.last_entropy is not None else None,
         }
+        if row_extra is not None:  # ORACLE001: per-generation determinism warnings (count, ops); default off
+            row.update(row_extra(provider, d))
         with runs.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
         if r.failure_kind in ("generate_failed", "load_failed"):
