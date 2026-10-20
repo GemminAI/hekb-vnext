@@ -42,9 +42,23 @@ def sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
-def seed_for(prompt_id: str, version: str, sample: int) -> int:
-    """Identical to ``d71.stage2.seed_for`` (stage 2 and stage 3 share the seed values)."""
-    return int(hashlib.sha256(f"D71|seed|{prompt_id}|{version}|{sample}".encode()).hexdigest()[:8], 16)
+SEED_PREFIX = "D71"  # stage 2 / stage 3 (default; reproduces their seeds)
+SEED_PREFIX_TRIGGER003 = "D71T3"  # EXP-D71-TRIGGER003: used whenever --conds is given (PREREG.md)
+
+
+def seed_for(prompt_id: str, version: str, sample: int, prefix: str = SEED_PREFIX) -> int:
+    """With the default prefix identical to ``d71.stage2.seed_for`` (stage 2 and stage 3 share the seed values)."""
+    return int(hashlib.sha256(f"{prefix}|seed|{prompt_id}|{version}|{sample}".encode()).hexdigest()[:8], 16)
+
+
+def parse_conds(spec: str | None) -> tuple[str, ...] | None:
+    """``--conds B`` -> ("B",). None (flag absent) keeps the stage-3 behaviour. Unknown names are an error."""
+    if spec is None:
+        return None
+    conds = tuple(c.strip() for c in spec.split(",") if c.strip())
+    if not conds or any(c not in CONDS for c in conds) or len(set(conds)) != len(conds):
+        raise ValueError(f"--conds must be a comma list drawn from {CONDS}: {spec!r}")
+    return conds
 
 
 def select_items(
@@ -62,7 +76,8 @@ def select_items(
 
 
 def build_design(
-    ids: list[str], contexts: dict[str, dict[str, Any]], *, conds: tuple[str, ...], samples: tuple[int, ...]
+    ids: list[str], contexts: dict[str, dict[str, Any]], *, conds: tuple[str, ...], samples: tuple[int, ...],
+    seed_prefix: str = SEED_PREFIX,
 ) -> list[dict[str, Any]]:
     rng = random.Random(ORDER_SEED)
     design: list[dict[str, Any]] = []
@@ -76,7 +91,7 @@ def build_design(
                     block.append({
                         "prompt_id": pid, "kind": cs["kind"], "difficulty": cs["difficulty"],
                         "version": version, "cond": cond, "sample": sample,
-                        "seed": seed_for(pid, version, sample), "user": c["user"],
+                        "seed": seed_for(pid, version, sample, seed_prefix), "user": c["user"],
                         "context_sha256": c["sha256"], "context_tokens": c["tokens"],
                         "removed": (cs["deficient"] or {}).get("removed") if version == "deficient" else None,
                         "expected": cs["expected"] if version == "sufficient" else None,
@@ -272,6 +287,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--expect-gpu", default=None, help="substring the GPU name must contain (e.g. A100)")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--conds", default=None,
+                    help="comma list of conditions (e.g. B). Absent = stage-3 behaviour. Present = TRIGGER003: "
+                         "also switches the seed prefix to D71T3 and applies to b0/calibrate/main/resample")
     a = ap.parse_args(argv)
     if a.mode == "manifest":
         print(json.dumps({"n_files": write_manifest(a.out)["n_files"]}))
@@ -295,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
     import torch
 
     settings = hf_provider.deterministic_torch(torch)
+    only = parse_conds(a.conds)
+    seed_prefix = SEED_PREFIX if only is None else SEED_PREFIX_TRIGGER003
     sel = json.loads(a.selection.read_text())
     ids = {"b0": sel["b0"], "calibrate": sel["calibration"], "main": sel["main"], "resample": sel["main"]}[a.mode]
     ctx = load_contexts(a.contexts, ids)
@@ -307,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
     provider._ensure_loaded()
     env = environment(provider)
     env["deterministic_settings"] = settings
+    env["conds_override"] = list(only) if only else None
+    env["seed_prefix"] = seed_prefix
     if a.expect_gpu and a.expect_gpu not in str(env["gpu_name"]):
         print(f"STOP: GPU {env['gpu_name']!r} does not match {a.expect_gpu!r}")
         return 7
@@ -314,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
     (a.out / "run_env.json").write_text(json.dumps(env, indent=1))
     if a.mode == "b0":
         first: dict[str, dict[str, Any]] = {}
-        for d0 in build_design(ids, ctx, conds=("A", "C"), samples=(0,)):
+        for d0 in build_design(ids, ctx, conds=only or ("A", "C"), samples=(0,), seed_prefix=seed_prefix):
             first.setdefault(d0["prompt_id"], d0)  # one generation per B0 item (5), each run twice
         design = list(first.values())
         results = []
@@ -338,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI o
                                                           "results": results}, indent=1))
         print("D71-B0", "PASS" if verdict else "FAIL")
         return 0 if verdict else 8
-    conds = ("A",) if a.mode == "calibrate" else CONDS
-    design = build_design(ids, ctx, conds=conds, samples=SAMPLES)
+    conds = only or (("A",) if a.mode == "calibrate" else CONDS)
+    design = build_design(ids, ctx, conds=conds, samples=SAMPLES, seed_prefix=seed_prefix)
     if a.mode == "resample":
         summ = run_resample(design, provider, a.out, system_prompt)
         (a.out / "resample_summary.json").write_text(json.dumps(summ, indent=1))

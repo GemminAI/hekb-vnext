@@ -152,3 +152,52 @@ def test_resample_rule_and_mismatch_recording(tmp_path: Path) -> None:
     assert summ2 is None
     rows = [json.loads(ln) for ln in (tmp_path / "resample.jsonl").read_text().splitlines()]
     assert [r["idx"] for r in rows] == [0, 10, 20] and all(r["token_ids_identical"] for r in rows)
+
+
+def _ctx_b(pid: str) -> dict[str, object]:
+    conds = {f"{v}:B": {"user": f"{pid}-{v}-B", "tokens": 10, "sha256": stage3.sha(f"{pid}-{v}-B")}
+             for v in ("sufficient", "deficient")}
+    return {"prompt_id": pid, "kind": "pow2", "difficulty": "easy", "deficient": {"removed": "n"},
+            "expected": "4", "conditions": conds}
+
+
+def test_default_seed_prefix_is_unchanged_and_trigger003_differs() -> None:
+    assert stage3.SEED_PREFIX == "D71" and stage3.SEED_PREFIX_TRIGGER003 == "D71T3"
+    assert stage3.seed_for("p", "sufficient", 1) == stage3.seed_for("p", "sufficient", 1, "D71")
+    assert stage3.seed_for("p", "sufficient", 1, "D71T3") != stage3.seed_for("p", "sufficient", 1)
+    import hashlib
+    exp = int(hashlib.sha256(b"D71T3|seed|p|deficient|2").hexdigest()[:8], 16)
+    assert stage3.seed_for("p", "deficient", 2, "D71T3") == exp
+
+
+def test_parse_conds() -> None:
+    import pytest
+    assert stage3.parse_conds(None) is None and stage3.parse_conds("B") == ("B",)
+    assert stage3.parse_conds("A, B") == ("A", "B")
+    for bad in ("", "X", "B,B", "b"):
+        with pytest.raises(ValueError):
+            stage3.parse_conds(bad)
+
+
+def test_conds_b_design_counts_and_seeds(tmp_path: Path) -> None:
+    ctx = {"a": _ctx_b("a"), "b": _ctx_b("b")}
+    design = stage3.build_design(["a", "b"], ctx, conds=("B",), samples=stage3.SAMPLES,
+                                 seed_prefix=stage3.SEED_PREFIX_TRIGGER003)
+    assert len(design) == 2 * 2 * 1 * 3 and {d["cond"] for d in design} == {"B"}
+    assert all(d["seed"] == stage3.seed_for(d["prompt_id"], d["version"], d["sample"], "D71T3") for d in design)
+    again = stage3.build_design(["a", "b"], ctx, conds=("B",), samples=stage3.SAMPLES,
+                                seed_prefix=stage3.SEED_PREFIX_TRIGGER003)
+    assert design == again  # deterministic order
+    prov = _provider([5, 128009])
+    stage3.run_generations(design, prov, tmp_path, "s")
+    assert {c["seed"] for c in prov._backend.calls} == {d["seed"] for d in design}  # type: ignore[attr-defined]
+    summ = stage3.run_resample(design, prov, tmp_path, "s", every=5)
+    assert summ["n_new"] == 3 and summ["mismatches_new"] == 0  # idx 0, 5, 10
+
+
+def test_trigger003_selection_format_loads(tmp_path: Path) -> None:
+    ctx_dir = tmp_path / "ctx" / "a"
+    ctx_dir.mkdir(parents=True)
+    (ctx_dir / "context_set.json").write_text(json.dumps(_ctx_b("a")))
+    loaded = stage3.load_contexts(tmp_path / "ctx", ["a"])
+    assert set(loaded["a"]["conditions"]) == {"sufficient:B", "deficient:B"}
