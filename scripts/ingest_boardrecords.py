@@ -44,6 +44,13 @@ process / separate port": no port is bound at all, so there is no possibility of
 colliding with the real 8300 service or any 8301+ instance. The 8300 service is never
 imported, started, or contacted by this script.
 
+Value-less cells (board-42-v2; docs/INGEST_BOARDRECORDS.md): a cell the board format defines
+without a value field (P15) arrives as `null`. By default the run STOPS with an IngestError that
+names the cell and `--drop-valueless-columns`; with that option the column is left out (37
+columns) and recorded in the space fingerprint (`space.excluded_columns`) and in
+`ext.hekbv3.ports.excluded_columns`. Nothing is stored as 0 or NaN. What a missing value means to
+HEKB in general is not decided here.
+
 Stops (raises, no retry) on: a shard's actual record count != manifest's n_records, a
 session with inconsistent anchor_policy_sha256 across its own records, a session's cells
 not forming a single consistent port_ids order, or any non-2xx HTTP response. Never writes
