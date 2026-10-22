@@ -22,6 +22,13 @@ REQUIRED_KEYS = (
 )
 
 
+#: Optional key, part of the fingerprint ONLY when present: the ingest dropped one or more
+#: valueless columns (board-42-v2's P15, ``--drop-valueless-columns``). Written ``"P15=valueless"``
+#: (comma-separated, sorted, for several). A space without it hashes exactly as before, so every
+#: existing ``space_id`` (including the 38-column board-42-v1 ones) is unchanged.
+OPTIONAL_KEYS = ("excluded_columns",)
+
+
 class SpaceIdError(ValueError):
     pass
 
@@ -30,13 +37,18 @@ def _canonical_bytes(space: dict[str, Any]) -> bytes:
     missing = [k for k in REQUIRED_KEYS if k not in space]
     if missing:
         raise SpaceIdError(f"space is missing required keys: {missing}")
-    extra = [k for k in space if k not in REQUIRED_KEYS]
+    extra = [k for k in space if k not in REQUIRED_KEYS and k not in OPTIONAL_KEYS]
     if extra:
         raise SpaceIdError(f"space has unexpected keys: {extra}")
     for k in REQUIRED_KEYS:
         if not isinstance(space[k], (str, int, float)):
             raise SpaceIdError(f"space[{k!r}] must be str/int/float, got {type(space[k]).__name__}")
     ordered = {k: space[k] for k in REQUIRED_KEYS}
+    if "excluded_columns" in space:
+        excluded = space["excluded_columns"]
+        if not isinstance(excluded, str) or not excluded:
+            raise SpaceIdError("space['excluded_columns'] must be a non-empty string (e.g. 'P15=valueless') or absent")
+        ordered["excluded_columns"] = excluded
     return json.dumps(ordered, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
