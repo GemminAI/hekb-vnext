@@ -241,14 +241,63 @@ def _read_raw_causal_log(raw_logs_root: Path, session_id: str, board_records: li
     return out, rel_path, raw_sha256
 
 
-def _session_ports_matrix(records: list[dict], session_id: str, expected_anchor_policy: str) -> tuple[list[list[int]], list[str]]:
+def _valueless_ports(records: list[dict]) -> list[str]:
+    """Ports whose cell carries no value (`null` in the wire form: board-42-v2's P15) in at least
+    one record, in cell order. A value-less cell is a cell the board format defines without a
+    value field; it is never a number (not 0, not NaN) and is not guessed here."""
+    found: dict[str, None] = {}
+    for rec in records:
+        for cell in rec["cells"]:
+            if cell[2] is None:
+                found[cell[0]] = None
+    return list(found)
+
+
+def _valueless_refusal(session_id: str, ports: list[str], board_format: str | None) -> IngestError:
+    names = ", ".join(ports)
+    return IngestError(
+        f"session {session_id}: cell(s) {names} carry no value (value=null; board_format "
+        f"{board_format!r} defines them as value-less cells, e.g. P15 in board-42-v2). Refusing to "
+        f"invent a value. Re-run with --drop-valueless-columns to ingest without the column(s) "
+        f"{names}; they are then recorded in the space fingerprint (excluded_columns) and in the "
+        f"trajectory metadata (ext.hekbv3.ports.excluded_columns). What a missing value means to "
+        f"HEKB in general is not decided here."
+    )
+
+
+def _scan_valueless(sessions: list[dict], shards_root: Path, board_format: str | None, drop: bool) -> list[str]:
+    """Pre-scan every shard in scope (the space, and so the space_id, is computed before any
+    session is ingested). Returns the value-less ports, identical for every session. Without
+    `drop` any value-less cell stops the run with a message that names the option."""
+    expected: list[str] | None = None
+    for s in sessions:
+        ports = _valueless_ports(_read_shard(shards_root / s["file"]))
+        if ports and not drop:
+            raise _valueless_refusal(s["session_id"], ports, board_format)
+        if expected is None:
+            expected = ports
+        elif ports != expected:
+            raise IngestError(
+                f"session {s['session_id']}: value-less cells {ports} differ from the other sessions' "
+                f"{expected}; one run ingests one space, so every session must have the same value-less columns"
+            )
+    return expected or []
+
+
+def _session_ports_matrix(
+    records: list[dict], session_id: str, expected_anchor_policy: str, dropped: tuple[str, ...] = ()
+) -> tuple[list[list[int]], list[str]]:
     """Validates internal consistency of one session's BoardRecord lines and returns
     (rows: n_steps x n_ports int64 cell values, in token order; port_ids: the fixed cell
-    order, read from the first record)."""
+    order, read from the first record). `dropped` names the value-less columns left out
+    (`--drop-valueless-columns`); each must be `null` in every record. Any other non-integer
+    value is an IngestError here, never an error from the blob encoder."""
     if not records:
         raise IngestError(f"session {session_id}: shard has zero records")
 
-    port_ids = [cell[0] for cell in records[0]["cells"]]
+    all_ports = [cell[0] for cell in records[0]["cells"]]
+    keep = [i for i, p in enumerate(all_ports) if p not in dropped]
+    port_ids = [all_ports[i] for i in keep]
     rows: list[list[int]] = []
     prev_token_index = -1
     for rec in records:
@@ -260,7 +309,7 @@ def _session_ports_matrix(records: list[dict], session_id: str, expected_anchor_
                 f"anchor_policy_sha256={rec.get('anchor_policy_sha256')!r}, expected {expected_anchor_policy!r}"
             )
         these_ports = [cell[0] for cell in rec["cells"]]
-        if these_ports != port_ids:
+        if these_ports != all_ports:
             raise IngestError(f"session {session_id}: cell port order is not consistent across records")
         token_index = rec["token_index"]
         if token_index <= prev_token_index:
@@ -269,7 +318,19 @@ def _session_ports_matrix(records: list[dict], session_id: str, expected_anchor_
                 f"({prev_token_index} -> {token_index})"
             )
         prev_token_index = token_index
-        rows.append([cell[2] for cell in rec["cells"]])
+        for i, cell in enumerate(rec["cells"]):
+            if all_ports[i] in dropped:
+                if cell[2] is not None:
+                    raise IngestError(
+                        f"session {session_id}: column {all_ports[i]} is dropped as value-less but record "
+                        f"token_index={token_index} has the value {cell[2]!r}"
+                    )
+            elif isinstance(cell[2], bool) or not isinstance(cell[2], int):
+                raise IngestError(
+                    f"session {session_id}: record token_index={token_index} cell {all_ports[i]} has a "
+                    f"non-integer value {cell[2]!r}"
+                )
+        rows.append([rec["cells"][i][2] for i in keep])
     return rows, port_ids
 
 
@@ -294,7 +355,7 @@ def _generate_dev_signer():
 def run_ingest(
     *, manifest_path: Path, shards_root: Path, data_dir: Path,
     only_session_ids: set[str] | None = None, progress_every: int = 50,
-    raw_logs_root: Path | None = None,
+    raw_logs_root: Path | None = None, drop_valueless_columns: bool = False,
 ) -> dict:
     """[HEKBV3-BUILD004] `raw_logs_root`, when given, points at the Mac-side TRJ003 replay
     output (e.g. .../trj003_48/results_vm) that the BoardRecord shards under `shards_root`
@@ -337,6 +398,14 @@ def run_ingest(
         "time_policy_sha256": manifest["time_policy_sha256"],
         "board_format": board_format, "quant_step_log2": quant_step_log2,
     }
+    # value-less columns (board-42-v2's P15): refused unless --drop-valueless-columns; when dropped
+    # they are part of the space fingerprint and of each trajectory's metadata, never silent.
+    scope = manifest["sessions"]
+    if only_session_ids is not None:
+        scope = [s for s in scope if s["session_id"] in only_session_ids]
+    excluded = _scan_valueless(scope, shards_root, board_format, drop_valueless_columns)
+    if excluded:
+        space["excluded_columns"] = ",".join(f"{p}=valueless" for p in sorted(excluded))
 
     token = "ingest-dev-token"
     store_service._bearer_guard.token = token
@@ -361,7 +430,7 @@ def run_ingest(
                 f"session {session_id}: shard has {len(records)} records, "
                 f"manifest declares n_records={s['n_records']}"
             )
-        rows, port_ids = _session_ports_matrix(records, session_id, manifest_anchor_policy)
+        rows, port_ids = _session_ports_matrix(records, session_id, manifest_anchor_policy, tuple(excluded))
 
         # created_at_ms=0 (fixed, not wall-clock): the blob's bytes -- and therefore its
         # sha256 and the resulting object_id -- must be identical on every re-run for the
@@ -374,13 +443,16 @@ def run_ingest(
         if blob_resp.status_code != 201:
             raise IngestError(f"session {session_id}: PUT /v3/blobs failed: {blob_resp.status_code} {blob_resp.text}")
 
+        ports_meta: dict = {
+            "blob_sha256": blob_sha256, "n_steps": len(rows), "dim": len(port_ids),
+            "port_ids": port_ids, "quant_step_log2": quant_step_log2,
+        }
+        if excluded:
+            ports_meta["excluded_columns"] = [{"port_id": p, "reason": "valueless"} for p in excluded]
         ext_hekbv3 = {
             "kind": "trajectory", "origin": "experience",
             "space": {**space, "space_id": space_id},
-            "ports": {
-                "blob_sha256": blob_sha256, "n_steps": len(rows), "dim": len(port_ids),
-                "port_ids": port_ids, "quant_step_log2": quant_step_log2,
-            },
+            "ports": ports_meta,
             "labels": {"category": s["category"], "split": s["split"], "group": s["group"]},
             "outcome": {"result": "n/a"},
         }
@@ -434,6 +506,7 @@ def run_ingest(
     return {
         "space_id": space_id, "data_dir": str(data_dir), "n_sessions": len(results), "sessions": results,
         "model_ref": model_ref, "model_ref_was_missing": model_ref_was_missing, "layer": layer,
+        "excluded_columns": list(excluded),
         "nvs_kernel_commit": manifest.get("nvs_kernel_commit"),
         "nvs_runtime_commit": manifest.get("nvs_runtime_commit"),
     }
@@ -485,6 +558,12 @@ def main() -> None:
                          help="Mac-side TRJ003 replay output root (e.g. .../trj003_48/results_vm) to pull the "
                               "full 38-port causal log from. When given, every session in scope must have a "
                               "matching raw log (stop on mismatch) -- see module docstring.")
+    parser.add_argument("--drop-valueless-columns", action="store_true",
+                         help="Ingest a board-42-v2 session whose value-less cell (P15, value null) has no "
+                              "number to store: leave that column out (37 columns). Default: refuse (IngestError). "
+                              "The dropped column(s) are recorded in the space fingerprint and in each "
+                              "trajectory's ext.hekbv3.ports.excluded_columns; their raw readings stay in the "
+                              "causal log when --raw-logs-root is given.")
     args = parser.parse_args()
 
     shards_root = args.shards_root or args.manifest.resolve().parent
@@ -493,6 +572,7 @@ def main() -> None:
         result = run_ingest(
             manifest_path=args.manifest, shards_root=shards_root, data_dir=args.data_dir,
             only_session_ids=only, raw_logs_root=args.raw_logs_root,
+            drop_valueless_columns=args.drop_valueless_columns,
         )
     except IngestError as exc:
         print(f"[ingest_boardrecords] STOP: {exc}", file=sys.stderr)

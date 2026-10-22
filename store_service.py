@@ -1066,6 +1066,8 @@ class SpaceIn(BaseModel):
     time_policy_sha256: str
     board_format: str
     quant_step_log2: int
+    #: only when valueless columns were dropped at ingest (index/space_id.py OPTIONAL_KEYS)
+    excluded_columns: str | None = None
 
 
 class SpaceIdOut(BaseModel):
@@ -1078,7 +1080,7 @@ def compute_space_id_route(space: SpaceIn) -> SpaceIdOut:
     space_id it must embed in ext.hekbv3.space without recomputing BLAKE2b-256 client-side.
     Read-only, no side effects."""
     try:
-        return SpaceIdOut(space_id=compute_space_id(space.model_dump()))
+        return SpaceIdOut(space_id=compute_space_id(space.model_dump(exclude_none=True)))
     except SpaceIdError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
