@@ -39,7 +39,7 @@ def producer(tag="a"):
 
 @pytest.fixture
 def store(tmp_path):
-    s = GraphStore(tmp_path, v01=False)
+    s = GraphStore(tmp_path, v01=False, blob_dir=tmp_path)
     s.add_node(f"hextdoc:{SPEC_HASH}", "hext_document", attrs={"hext_kind": "source", "state_hash": SPEC_HASH})
     s.add_node("hextdoc:sha256:annot", "hext_document", attrs={"hext_kind": "annotation", "state_hash": "sha256:annot"})
     s.add_node("traj", "trajectory")
@@ -59,12 +59,18 @@ def write_context(store, ep, **over):
     return store.write_ctp_node("context_observation", fields, producer=producer())
 
 
+def ctx_blob(store, label):
+    """Put the context a step was given into the store's blob location; returns its sha256."""
+    return write_blob(store.blob_dir, f"context:{label}".encode())
+
+
 def step_fields(ep, step="f1", sha="2" * 64, **over):
     return {"episode_id": ep, "step": step, "text_ref": "blob:" + "3" * 64, "input_context_ref": f"blob:{sha}", "input_context_sha256": sha, **over}
 
 
-def write_step(store, ep, step="f1", **over):
-    return store.write_ctp_node("step_output", step_fields(ep, step, **over), producer=producer())
+def write_step(store, ep, step="f1", sha=None, **over):
+    sha = sha or ctx_blob(store, f"{ep}/{step}")
+    return store.write_ctp_node("step_output", step_fields(ep, step, sha, **over), producer=producer())
 
 
 @pytest.fixture
@@ -171,7 +177,7 @@ def test_has_context_and_has_step_need_the_same_episode(store, ep):
 # ---- step_output ---------------------------------------------------------------------------------------------------
 def test_step_output_needs_the_input_context_ref_and_its_sha256(store, ep):
     assert write_step(store, ep)
-    node = store.build_ctp_node("step_output", step_fields(fresh(store, 1), sha="7" * 64), producer=producer())
+    node = store.build_ctp_node("step_output", step_fields(fresh(store, 1), sha=ctx_blob(store, "seven")), producer=producer())
     for drop in ("input_context_ref", "input_context_sha256"):
         with pytest.raises(CtpError, match="attrs lack"):
             store.add_node(node["node_id"], "step_output", kind="observation", verification="unverified", attrs={k: v for k, v in node["attrs"].items() if k != drop})
@@ -183,20 +189,28 @@ def test_step_output_needs_the_input_context_ref_and_its_sha256(store, ep):
         write_step(store, fresh(store, 4), step="f4")
 
 
-def test_a_blob_in_the_data_dir_must_hash_to_input_context_sha256(store, ep, tmp_path):
-    data = b"the context given to f2"
-    sha = write_blob(tmp_path, data)
-    assert write_step(store, ep, step="f2", sha=sha)  # the blob is there and matches
+def test_the_blob_must_be_given_present_and_hash_to_input_context_sha256(store, ep, tmp_path):
+    sha = write_blob(tmp_path, b"the context given to f2")
+    assert write_step(store, ep, step="f2", sha=sha)  # location given, blob there, bytes match
+    absent = "a" * 64
+    with pytest.raises(CtpError, match="is not in the blob location"):
+        write_step(store, ep, step="f3", sha=absent)  # an address alone is not enough any more
     other = hashlib.sha256(b"something else").hexdigest()
     path = blob_path(tmp_path, other)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"not what the address says")  # a blob whose bytes do not hash to its name
     with pytest.raises(CtpError, match="does not hash"):
-        write_step(store, ep, step="f3", sha=other)
+        write_step(store, fresh(store, 7), step="f3", sha=other)
 
 
-def test_a_blob_that_is_not_in_this_data_dir_is_accepted_on_its_address_alone(store, ep):
-    assert write_step(store, ep, sha="a" * 64)  # no file: HEKB's blob service may hold it elsewhere
+def test_a_store_without_a_blob_location_refuses_every_step_output(tmp_path):
+    s = GraphStore(tmp_path, v01=False)  # no blob_dir
+    s.add_node(f"hextdoc:{SPEC_HASH}", "hext_document", attrs={"hext_kind": "source", "state_hash": SPEC_HASH})
+    e = s.write_ctp_node("episode", episode_fields(), producer=producer())
+    sha = write_blob(tmp_path, b"the blob exists on disk, but the store was not told where blobs are")
+    with pytest.raises(CtpError, match="no blob location was given"):
+        s.write_ctp_node("step_output", step_fields(e, "f1", sha), producer=producer())
+    assert not [n for n in s.nodes() if n["node_type"] == "step_output"]
 
 
 def test_retrieved_goes_from_the_f1_step_to_a_source_document(store, ep):
@@ -380,7 +394,7 @@ def test_floats_and_out_of_range_integers_are_refused_in_every_ctp_type(store, e
         fields = {
             "episode": episode_fields(item_id=f"f{n}"),
             "context_observation": {"episode_id": e2, "context_ref": "blob:" + "1" * 64, "knowledge_ids": [], "constraint_annotation_ids": [], "task_ref": "t", "contains_experience": False},
-            "step_output": step_fields(e2, "f2"),
+            "step_output": step_fields(e2, "f2", ctx_blob(store, "floats")),
             "applicability": {"episode_id": e2, "constraint_id": "c1", "applicability": "applicable", "applicability_basis": "fixture"},
             "carry_evidence": {"episode_id": e2, "step": "f1", "property": "p", "status": "lost", "basis": "declared", "evidence_ref": None},
             "cle_result": {"episode_id": e2, "rule": "R9", "mode": "M1", "value": "PASS", "reason_codes": [], "locations": [], "history_hash": "h"},
@@ -444,12 +458,14 @@ import json, sys
 sys.path.insert(0, {root!r})
 from pathlib import Path
 from graph.store import GraphStore
-s = GraphStore(Path(sys.argv[1]), v01=False)
+from graph.blobs import write_blob
+s = GraphStore(Path(sys.argv[1]), v01=False, blob_dir=Path(sys.argv[1]))
+sha = write_blob(Path(sys.argv[1]), b"the context given to f1")
 spec = "sha256:" + "5" * 64
 s.add_node("hextdoc:" + spec, "hext_document", attrs={{"hext_kind": "source", "state_hash": spec}})
 P = {{"component": "v", "version": "1", "config_sha256": "c" * 64}}
 ep = s.write_ctp_node("episode", {{"experiment_spec_hash": spec, "item_id": "i", "bundle_id": "b", "split": "fit", "condition": "a", "replicate": 0, "rng_seed": 1}}, producer=P)
-step = s.write_ctp_node("step_output", {{"episode_id": ep, "step": "f1", "text_ref": "blob:" + "3" * 64, "input_context_ref": "blob:" + "2" * 64, "input_context_sha256": "2" * 64}}, producer=P)
+step = s.write_ctp_node("step_output", {{"episode_id": ep, "step": "f1", "text_ref": "blob:" + "3" * 64, "input_context_ref": "blob:" + sha, "input_context_sha256": sha}}, producer=P)
 c = s.write_ctp_node("compliance", {{"episode_id": ep, "level": "L1", "judge": "verifier", "value": "PASS", "reason_codes": []}}, producer=P, input_nodes=(step,), input_facts={{"k": 1}})
 s.add_edge("interprets", c, step)
 print(json.dumps({{"ids": [ep, step, c], "nodes": Path(sys.argv[1], "graph", "nodes.jsonl").read_text(), "edges": Path(sys.argv[1], "graph", "edges.jsonl").read_text()}}))
@@ -488,10 +504,10 @@ def test_an_episode_under_a_projected_hext_source_document(tmp_path):
     heads = layer.manifest()["heads"]
     state_hash = json.loads(SRC.read_bytes())["final_seal"]["state_hash"]
     doc = doc_node_id(state_hash)
-    s = GraphStore(tmp_path, v01=False)
+    s = GraphStore(tmp_path, v01=False, blob_dir=tmp_path)
     ep = s.write_ctp_node("episode", episode_fields(experiment_spec_hash=state_hash), producer=producer())
     assert s.add_edge("under_manifest", ep, doc)  # the end is in the projection layer's log
-    step = s.write_ctp_node("step_output", step_fields(ep), producer=producer())
+    step = s.write_ctp_node("step_output", step_fields(ep, "f1", ctx_blob(s, "p0")), producer=producer())
     assert s.add_edge("has_step", ep, step) and s.add_edge("retrieved", step, doc)
     ce = s.write_ctp_node("carry_evidence", {"episode_id": ep, "step": "f1", "property": "c1.condition", "status": "preserved", "basis": "evidence", "evidence_ref": "fixture:x"}, producer=producer(), input_nodes=(step, doc))
     assert s.add_edge("interprets", ce, step) and s.add_edge("interprets", ce, doc)
@@ -499,3 +515,162 @@ def test_an_episode_under_a_projected_hext_source_document(tmp_path):
         s.write_ctp_node("episode", episode_fields(experiment_spec_hash="sha256:" + "0" * 64), producer=producer())
     assert HextProjectionLayer(tmp_path).manifest()["heads"] == heads  # the projection layer is untouched
     assert s.axis_consistency().ok
+
+
+# ---- observed_at is for observations only -----------------------------------------------------------------------
+def sample_fields(store, ep):
+    """One valid field set for every type except episode, and the inputs a judgement needs."""
+    step = write_step(store, ep, "f1")
+    ctx = write_context(store, ep)
+    return step, {
+        "context_observation": {"episode_id": ep, "context_ref": "blob:" + "8" * 64, "knowledge_ids": [], "constraint_annotation_ids": [], "task_ref": "t", "contains_experience": False},
+        "step_output": step_fields(ep, "f2", ctx_blob(store, f"sample/{ep}")),
+        "applicability": {"episode_id": ep, "constraint_id": "c1", "applicability": "applicable", "applicability_basis": "fixture"},
+        "carry_evidence": {"episode_id": ep, "step": "f1", "property": "p", "status": "lost", "basis": "declared", "evidence_ref": None},
+        "cle_result": {"episode_id": ep, "rule": "R9", "mode": "M1", "value": "PASS", "reason_codes": [], "locations": [], "history_hash": "h"},
+        "compliance": {"episode_id": ep, "level": "L1", "judge": "verifier", "value": "PASS", "reason_codes": []},
+        "plan": {"episode_id": ep, "plan_id": "p", "steps": [], "probability_source": "unobserved"},
+        "governance": {"episode_id": ep, "plan_id": "p", "decision": "admit", "reason_codes": []},
+        "outcome": outcome_fields(ep),
+    } | {"_ctx": ctx}
+
+
+OBSERVATIONS = ("episode", "context_observation", "step_output")
+NOT_OBSERVATIONS = ("applicability", "carry_evidence", "cle_result", "compliance", "plan", "governance", "outcome")
+
+
+def test_observed_at_is_a_field_of_observations_only(store, ep):
+    assert all(ctp.SPECS[t].observation for t in OBSERVATIONS) and not any(ctp.SPECS[t].observation for t in NOT_OBSERVATIONS)
+    step, fields = sample_fields(store, fresh(store, 50))
+    e2 = fields["compliance"]["episode_id"]
+    for n, node_type in enumerate(OBSERVATIONS):
+        base = {"episode": episode_fields(item_id=f"obs{n}"), "context_observation": fields["context_observation"], "step_output": fields["step_output"]}[node_type]
+        for stamp in (None, "2026-11-03T10:00:00Z"):
+            node = store.build_ctp_node(node_type, base, producer=producer(), observed_at=stamp)
+            assert node["attrs"]["observed_at"] == stamp  # the key is there, null or a label
+        assert node["node_id"] == store.build_ctp_node(node_type, base, producer=producer())["node_id"]  # and it is not in the id
+        assert store.add_node(node["node_id"], node_type, kind=node["kind"], verification="unverified", attrs=node["attrs"])
+    assert e2
+
+
+@pytest.mark.parametrize("node_type", NOT_OBSERVATIONS)
+def test_a_judgement_selection_or_outcome_with_observed_at_is_refused(store, ep, node_type):
+    step, fields = sample_fields(store, fresh(store, 60))
+    f = fields[node_type]
+    with pytest.raises(CtpError, match="observed_at is only for observations"):
+        store.build_ctp_node(node_type, f, producer=producer(), input_nodes=(step,), observed_at="2026-11-03T10:00:00Z")
+    node = store.build_ctp_node(node_type, f, producer=producer(), input_nodes=(step,))
+    assert "observed_at" not in node["attrs"]
+    for stamp in ("2026-11-03T10:00:00Z", None):  # a stamp, or even a null one
+        with pytest.raises(CtpError, match="observed_at is only for observations"):
+            store.add_node(node["node_id"], node_type, kind=node["kind"], verification="unverified", attrs={**node["attrs"], "observed_at": stamp})
+    assert store.add_node(node["node_id"], node_type, kind=node["kind"], verification="unverified", attrs=node["attrs"])
+
+
+@pytest.mark.parametrize("node_type", NOT_OBSERVATIONS)
+def test_scoring_again_with_the_same_inputs_and_evaluator_succeeds_idempotently(store, ep, node_type):
+    step, fields = sample_fields(store, fresh(store, 70))
+    first = store.write_ctp_node(node_type, fields[node_type], producer=producer(), input_nodes=(step,))
+    count = len(store.nodes_log)
+    head = store.nodes_log.head
+    again = store.write_ctp_node(node_type, fields[node_type], producer=producer(), input_nodes=(step,))  # a re-run
+    assert again == first and (len(store.nodes_log), store.nodes_log.head) == (count, head)  # nothing was appended
+    fresh_store = GraphStore(store.root.parent, v01=False, blob_dir=store.blob_dir)  # and a new process would do the same
+    assert fresh_store.write_ctp_node(node_type, fields[node_type], producer=producer(), input_nodes=(step,)) == first
+    assert len(fresh_store.nodes_log) == count
+
+
+# ---- the whole chain, and the search ------------------------------------------------------------------------------
+def make_spec_document():
+    """A HEXT v2 source for an experiment spec, sealed with the reference implementation (test data)."""
+    sys.path.insert(0, str(Path.home() / "GemminAI" / "hext" / "reference" / "python"))
+    create = pytest.importorskip("hext2.create")
+    t = "2026-11-03T00:00:00Z"
+    _doc, sealed = create.create_and_seal(
+        object_id="urn:test:exp-rag-ctp001-spec", object_type="document.experiment-spec",
+        evidence=[{"evidence_id": "ev-1", "format": "text/plain; charset=utf-8", "body": "EXP-RAG-CTP001: carry a constraint through f1, f2, f3"}],
+        contributors=[{"agent": "system:test", "role": "generator"}], primary_generator="ai", human_touch="0.0",
+        ledger=[{"t": t, "type": "SYSTEM", "actor": "system:test", "delta": 1}], sealed_at=t,
+    )
+    return sealed.canonical_bytes
+
+
+def chain(store, doc, state_hash, item, bundle, two_axis, violation_type):
+    """One episode, every record of the first half. Returns the node ids by name."""
+    ids = {}
+    ep = ids["episode"] = store.write_ctp_node("episode", episode_fields(experiment_spec_hash=state_hash, item_id=item, bundle_id=bundle), producer=producer(), observed_at="2026-11-03T09:00:00Z")
+    assert store.add_edge("under_manifest", ep, doc)
+    ctx = ids["context"] = write_context(store, ep)
+    assert store.add_edge("has_context", ep, ctx)
+    for i, step in enumerate(("f1", "f2", "f3")):
+        sid = ids[step] = write_step(store, ep, step, sha=ctx_blob(store, f"{item}/{step}"))  # a blob per stage, written first
+        assert store.add_edge("has_step", ep, sid)
+        if step == "f1":
+            assert store.add_edge("retrieved", sid, doc)
+    app = ids["applicability"] = store.write_ctp_node("applicability", {"episode_id": ep, "constraint_id": "c1", "applicability": "applicable", "applicability_basis": "fixture"}, producer=producer("app"), input_nodes=(ctx, doc))
+    store.add_edge("interprets", app, ctx)
+    for step in ("f1", "f2", "f3"):
+        for basis, ref, status in (("declared", None, "preserved"), ("evidence", f"fixture:{item}/{step}", "lost" if step != "f1" else "preserved")):
+            ce = store.write_ctp_node("carry_evidence", {"episode_id": ep, "step": step, "property": "c1.condition", "status": status, "basis": basis, "evidence_ref": ref}, producer=producer("ver"), input_nodes=(ids[step], doc))
+            ids[f"carry-{step}-{basis}"] = ce
+            store.add_edge("interprets", ce, ids[step])
+    for mode, value in (("M1", "PASS"), ("M2", "FAIL")):
+        ids[f"cle-{mode}"] = store.write_ctp_node("cle_result", {"episode_id": ep, "rule": "R9", "mode": mode, "value": value, "reason_codes": [] if value == "PASS" else ["OBLIGATION_LOST_BY_EVIDENCE"], "locations": [] if value == "PASS" else ["f2"], "history_hash": "h" * 8},
+                                                  producer=producer("cle"), input_nodes=(ids["carry-f1-declared"], ids["carry-f1-evidence"]), input_facts={"obligations": ["c1.condition"]})
+    for level, step in (("L1", "f2"), ("L2", "f2"), ("L3", "f2"), ("f3", "f3")):
+        c = ids[f"compliance-{level}"] = store.write_ctp_node("compliance", {"episode_id": ep, "level": level, "judge": "verifier", "value": "FAIL" if level != "L1" else "PASS", "reason_codes": []}, producer=producer("ver"), input_nodes=(ids[step],), input_facts={"amount_usd": 800, "approval_obtained": False})
+        store.add_edge("interprets", c, ids[step])
+    plan = ids["plan"] = store.write_ctp_node("plan", {"episode_id": ep, "plan_id": f"plan-{item}", "steps": ["f1", "f2", "f3"], "probability_source": "unobserved"}, producer=producer("planner"), input_nodes=(ctx,))
+    gov = ids["governance"] = store.write_ctp_node("governance", {"episode_id": ep, "plan_id": f"plan-{item}", "decision": "hold", "reason_codes": ["OBLIGATION_LOST_BY_EVIDENCE"]}, producer=producer("gov"), input_nodes=(plan, ids["cle-M2"]), input_facts={"cancelled": False, "quota": {"active": 0, "spent": 3}})
+    assert store.add_edge("selects", gov, plan)
+    fields = {"episode_id": ep, "carry": {"f1": "preserved", "f2": "lost", "f3": "lost"}, "constraint_compliance": "FAIL", "two_axis": two_axis}
+    if violation_type:
+        fields["violation_type"] = violation_type
+    out = ids["outcome"] = store.write_ctp_node("outcome", fields, producer=producer("out"), input_nodes=(ids["compliance-f3"], gov))
+    assert store.add_edge("outcome_of", out, ep) and store.add_edge("outcome_of", out, gov)
+    return ids
+
+
+def test_a_whole_episode_is_stored_and_found_by_the_search(tmp_path):
+    spec = make_spec_document()
+    layer = HextProjectionLayer(tmp_path)
+    layer.rebuild([(spec, {})], resolve_session=lambda s: None)
+    state_hash = json.loads(spec)["final_seal"]["state_hash"]
+    doc = doc_node_id(state_hash)
+    store = GraphStore(tmp_path, v01=False, blob_dir=tmp_path)
+    one = chain(store, doc, state_hash, "i1", "b1", "LOST_VIOLATED", "constraint_dropped")
+    two = chain(store, doc, state_hash, "i2", "b1", "CARRIED_VIOLATED", "constraint_broken")
+    three = chain(store, doc, state_hash, "i3", "b2", "LOST_VIOLATED", "constraint_dropped")
+    kinds = {n["node_type"] for n in store.nodes()}
+    assert set(ctp.CTP_NODE_TYPES) <= kinds and all(d70_class(n) for n in store.nodes() if n["node_type"] in ctp.CTP_NODE_TYPES)
+    # every stage has its blob, and the spec is the projected HEXT source
+    assert all(blob_path(tmp_path, n["attrs"]["input_context_sha256"]).exists() for n in store.nodes() if n["node_type"] == "step_output")
+    assert store.attrs(doc)["hext_kind"] == "source" and store.attrs(doc)["state_hash"] == state_hash
+
+    ids = lambda found: [r["node_id"] for r in found]  # noqa: E731
+    assert ids(store.find_outcomes()) == sorted([one["outcome"], two["outcome"], three["outcome"]])
+    assert ids(store.find_outcomes(two_axis="LOST_VIOLATED")) == sorted([one["outcome"], three["outcome"]])
+    assert ids(store.find_outcomes(two_axis="CARRIED_VIOLATED")) == [two["outcome"]]
+    assert ids(store.find_outcomes(bundle_id="b1")) == sorted([one["outcome"], two["outcome"]])
+    assert ids(store.find_outcomes(bundle_id="b2")) == [three["outcome"]]
+    assert ids(store.find_outcomes(violation_type="constraint_broken")) == [two["outcome"]]
+    assert ids(store.find_outcomes(violation_type="constraint_dropped")) == sorted([one["outcome"], three["outcome"]])
+    # combinations
+    assert ids(store.find_outcomes(two_axis="LOST_VIOLATED", bundle_id="b1")) == [one["outcome"]]
+    assert ids(store.find_outcomes(two_axis="LOST_VIOLATED", bundle_id="b2", violation_type="constraint_dropped")) == [three["outcome"]]
+    assert store.find_outcomes(two_axis="CARRIED_VIOLATED", bundle_id="b2") == []
+    assert store.find_outcomes(two_axis="LOST_VIOLATED", violation_type="constraint_broken") == []
+    assert ids(store.find_outcomes(two_axis=("LOST_VIOLATED", "CARRIED_VIOLATED"), bundle_id=("b1",))) == sorted([one["outcome"], two["outcome"]])
+    assert store.find_outcomes(bundle_id="nope") == []
+    assert all(r["node_type"] == "outcome" for r in store.find_outcomes())
+    assert ids(GraphStore(tmp_path, v01=False, blob_dir=tmp_path).find_outcomes(bundle_id="b1", two_axis="LOST_VIOLATED")) == [one["outcome"]]  # a new store object sees the same
+
+    # a scoring that disagrees with itself: same evaluator, same inputs, another result
+    assert store.nondeterminism() == []
+    again = store.write_ctp_node("compliance", {"episode_id": one["episode"], "level": "L2", "judge": "verifier", "value": "PASS", "reason_codes": []}, producer=producer("ver"),
+                                 input_nodes=(one["f2"],), input_facts={"amount_usd": 800, "approval_obtained": False})
+    assert again != one["compliance-L2"]
+    groups = store.nondeterminism()
+    assert len(groups) == 1 and groups[0].node_type == "compliance" and groups[0].node_ids == tuple(sorted([one["compliance-L2"], again]))
+    assert HextProjectionLayer(tmp_path).manifest()["heads"] == layer.manifest()["heads"]  # the projection layer was not touched
+    assert store.axis_consistency().ok

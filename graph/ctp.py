@@ -4,7 +4,8 @@ CTP common data model v0.3 (sections 2-4, 7, 8) with v0.3.1-v0.3.4; v0.3.4 decid
 
 * Every record keeps the existing five fields; the CTP common fields live in ``attrs`` next to the type's own
   fields: ``schema`` (``"ctp.datamodel/0.3"``), ``refs``, ``producer`` ``{component, version, config_sha256}`` and
-  ``observed_at`` (a label that is never part of an id and never orders anything).
+  ``observed_at`` (observation types only: a label that is never part of an id and never orders anything; a judgement,
+  selection or outcome has none, so scoring again with the same inputs and evaluator writes the very same record).
 * ``kind`` is the D-70 word of the type and the ``verification`` column is the constant ``"unverified"`` (as for
   ``axis_verification``). Write with ``GraphStore(v01=False)``.
 * ``attrs`` pass through ``graph.jcs``: a floating-point number or an integer beyond +-(2**53 - 1) is refused.
@@ -92,6 +93,15 @@ class Spec:
     @property
     def judgement(self) -> bool:
         return bool(self.result)
+
+    @property
+    def observation(self) -> bool:
+        return self.d70 == "observation"
+
+    @property
+    def common(self) -> tuple[str, ...]:
+        """The common fields of the type: ``observed_at`` only for observations."""
+        return COMMON if self.observation else tuple(f for f in COMMON if f != "observed_at")
 
 
 SPECS: Final[Mapping[str, Spec]] = {
@@ -182,7 +192,7 @@ class Context(Protocol):
 
     def record_hash(self, node_id: str) -> str | None: ...
 
-    def data_dir(self) -> Path: ...
+    def blob_root(self) -> Path | None: ...
 
 
 def _sha(value: Any) -> str:
@@ -237,7 +247,11 @@ def build_node(
 ) -> dict[str, Any]:
     """The node record for one CTP record. ``hash_of`` gives the stored record hash of each input node."""
     spec = SPECS[node_type]
-    attrs: dict[str, Any] = {"schema": SCHEMA, **fields, "refs": dict(refs or {}), "producer": dict(producer), "observed_at": observed_at}
+    if observed_at is not None and not spec.observation:
+        raise CtpError(f"{node_type}: observed_at is only for observations (episode, context_observation, step_output)")
+    attrs: dict[str, Any] = {"schema": SCHEMA, **fields, "refs": dict(refs or {}), "producer": dict(producer)}
+    if spec.observation:
+        attrs["observed_at"] = observed_at
     if spec.judgement:
         facts = dict(input_facts or {})
         ids = sorted(set(input_nodes))
@@ -300,8 +314,10 @@ def check_node(record: Mapping[str, Any], ctx: Context) -> None:
     attrs = record.get("attrs")
     if not isinstance(attrs, dict):
         raise refuse("attrs must be an object")
-    allowed = {*spec.required, *spec.optional, *COMMON, *(JUDGEMENT_INPUTS if spec.judgement else ())}
-    missing = [k for k in (*spec.required, *COMMON, *(JUDGEMENT_INPUTS if spec.judgement else ())) if k not in attrs]
+    if "observed_at" in attrs and not spec.observation:
+        raise refuse("observed_at is only for observations (episode, context_observation, step_output)")
+    allowed = {*spec.required, *spec.optional, *spec.common, *(JUDGEMENT_INPUTS if spec.judgement else ())}
+    missing = [k for k in (*spec.required, *spec.common, *(JUDGEMENT_INPUTS if spec.judgement else ())) if k not in attrs]
     if missing:
         raise refuse(f"attrs lack {missing}")
     _check_forbidden(node_type, attrs, refuse)  # named first: "no probability" says more than "outside the type"
@@ -319,7 +335,7 @@ def check_node(record: Mapping[str, Any], ctx: Context) -> None:
     producer = attrs["producer"]
     if not isinstance(producer, dict) or set(producer) != set(PRODUCER_FIELDS) or not all(_is_str(producer[k]) for k in PRODUCER_FIELDS):
         raise refuse(f"producer must be an object with the string fields {PRODUCER_FIELDS}")
-    if attrs["observed_at"] is not None and not _is_str(attrs["observed_at"]):
+    if spec.observation and attrs["observed_at"] is not None and not _is_str(attrs["observed_at"]):
         raise refuse("observed_at must be a string or null")
     _check_fields(node_type, attrs, ctx, refuse)
     if spec.judgement:
@@ -432,18 +448,24 @@ def _check_fields(node_type: str, a: Mapping[str, Any], ctx: Context, refuse: Ca
 
 
 def _check_blob_ref(a: Mapping[str, Any], ctx: Context, refuse: Callable[[str], CtpError]) -> None:
-    """input_context_ref is ``blob:<sha256>``; its hash must be input_context_sha256, and the bytes must hash to it.
+    """input_context_ref is ``blob:<sha256>`` and the blob must be there with those bytes.
 
-    The bytes are read from the data dir's ``blobs/aa/bb/<sha256>`` when the blob is there. HEKB's blob store
-    (storage/blobs.py) may keep it in another data dir, so an absent blob is not an error: only the address is checked.
+    The store is given its blob location (``GraphStore(blob_dir=...)``, the dir that holds ``blobs/aa/bb/<sha256>``).
+    Without one, with no such blob, or with bytes that do not hash to ``input_context_sha256``, the write is refused:
+    an address alone is not evidence that the context a step was given still exists.
     """
     m = _BLOB_REF.match(a["input_context_ref"])
     if m is None:
         raise refuse("input_context_ref must be 'blob:<sha256 hex>'")
     if not _HEX64.match(a["input_context_sha256"]) or m.group(1) != a["input_context_sha256"]:
         raise refuse("input_context_sha256 is not the sha256 in input_context_ref")
-    path = blob_path(ctx.data_dir(), m.group(1))
-    if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != m.group(1):
+    root = ctx.blob_root()
+    if root is None:
+        raise refuse("no blob location was given to the store (GraphStore(blob_dir=...)), so input_context_ref cannot be checked")
+    path = blob_path(root, m.group(1))
+    if not path.exists():
+        raise refuse(f"the blob {m.group(1)} is not in the blob location")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != a["input_context_sha256"]:
         raise refuse("the blob's content does not hash to input_context_sha256")
 
 
@@ -564,3 +586,40 @@ def nondeterministic_groups(records: Mapping[str, Mapping[str, Any]]) -> list[No
         if len(set(members.values())) > 1:
             out.append(NondeterminismGroup(str(node_type), ident, in_hash, fp, tuple(sorted(members))))
     return out
+
+
+# ---- search ------------------------------------------------------------------------------------------------------
+def _wanted(value: str | tuple[str, ...] | list[str] | frozenset[str] | set[str] | None) -> frozenset[str] | None:
+    if value is None:
+        return None
+    return frozenset([value]) if isinstance(value, str) else frozenset(value)
+
+
+def find_outcomes(
+    records: Mapping[str, Mapping[str, Any]],
+    *,
+    two_axis: str | tuple[str, ...] | list[str] | None = None,
+    bundle_id: str | tuple[str, ...] | list[str] | None = None,
+    violation_type: str | tuple[str, ...] | list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """The outcome records that match every given filter (all optional; a tuple means "any of these").
+
+    ``bundle_id`` is the bundle of the outcome's episode. The result is sorted by node_id.
+    """
+    axes, bundles, kinds = _wanted(two_axis), _wanted(bundle_id), _wanted(violation_type)
+    found = []
+    for node_id in sorted(records):
+        rec = records[node_id]
+        if rec.get("node_type") != "outcome":
+            continue
+        a = rec["attrs"]
+        if axes is not None and a["two_axis"] not in axes:
+            continue
+        if kinds is not None and a.get("violation_type") not in kinds:
+            continue
+        if bundles is not None:
+            episode = records.get(a["episode_id"])
+            if episode is None or episode["attrs"]["bundle_id"] not in bundles:
+                continue
+        found.append(dict(rec))
+    return found

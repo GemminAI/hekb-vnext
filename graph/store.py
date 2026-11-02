@@ -19,9 +19,11 @@ from graph.model import validate_edge, validate_node
 
 
 class GraphStore:
-    def __init__(self, data_dir: Path, *, v01: bool = True) -> None:
+    def __init__(self, data_dir: Path, *, v01: bool = True, blob_dir: Path | None = None) -> None:
         self.root = Path(data_dir) / "graph"
         self.v01 = v01
+        #: where the blobs are (the dir that holds ``blobs/aa/bb/<sha256>``); a ``step_output`` is refused without it
+        self.blob_dir = Path(blob_dir) if blob_dir is not None else None
         self._lock = GraphLock.of(self.root)
         self._types: dict[str, str] = {}  # node_id -> node_type, derived from the node log
         self._axis = axis.AxisIndex()  # axis_verification records and who replaced whom, derived from the logs
@@ -60,8 +62,8 @@ class GraphStore:
     def record_hash(self, node_id: str) -> str | None:
         return self._record_hash_of(node_id)
 
-    def data_dir(self) -> Path:
-        return self.root.parent
+    def blob_root(self) -> Path | None:
+        return self.blob_dir
 
     def _check_node(self, record: dict[str, Any]) -> None:
         check_stored_kind(record)
@@ -190,6 +192,18 @@ class GraphStore:
             node = self.build_ctp_node(node_type, fields, **kwargs)
             self.add_node(node["node_id"], node["node_type"], kind=node["kind"], verification=node["verification"], attrs=node["attrs"])
             return str(node["node_id"])
+
+    def find_outcomes(
+        self,
+        *,
+        two_axis: str | tuple[str, ...] | list[str] | None = None,
+        bundle_id: str | tuple[str, ...] | list[str] | None = None,
+        violation_type: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Outcome records by two_axis, the episode's bundle_id and violation_type (any combination; a tuple is "any of")."""
+        with self._lock:
+            self._nodes.refresh()
+            return ctp.find_outcomes(self._recs, two_axis=two_axis, bundle_id=bundle_id, violation_type=violation_type)
 
     def nondeterminism(self) -> list[ctp.NondeterminismGroup]:
         """Judgements with the same identity, inputs and evaluator but another result (reported, never refused)."""
