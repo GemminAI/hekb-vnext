@@ -62,12 +62,19 @@ CONFLICT: Final = "conflict"
 REPLACING_EDGES: Final = ("supersedes", "corrects")
 VERIFIABLE_CLASSES: Final = ("evidence", "interpretation")
 PRODUCER_FIELDS: Final = ("component", "version", "config_sha256")
+#: ``integrity=sealed`` needs a verified signature, and no signature verification exists yet (v0.3.2 s3). Until it
+#: does, every sealed write is refused whatever its method says; set this to True (the one switch) and the
+#: method-shape check below applies again.
+SEALED_WRITES_ENABLED: Final = False
+SEALED_REFUSED_CODE: Final = "SIGNATURE_VERIFICATION_NOT_IMPLEMENTED"
 BASIS_NO_RECORD: Final = "no_record"
 BASIS_RECORDED: Final = "recorded"
 
 
 class AxisVerificationError(GraphError):
-    """An axis_verification record that breaks the rules of its type."""
+    """An axis_verification record that breaks the rules of its type (``reason_code`` when it has a stable one)."""
+
+    reason_code: str | None = None
 
 
 class EdgeRuleError(GraphError):
@@ -172,6 +179,10 @@ def check_node(record: Mapping[str, Any], target_record_hash: Callable[[str], st
         raise refuse(f"axis {axis!r} is not one of {AXES}")
     if value not in AXIS_VALUES[axis]:
         raise refuse(f"value {value!r} is not a value of the {axis} axis {AXIS_VALUES[axis]}")
+    if axis == "integrity" and value == "sealed" and not SEALED_WRITES_ENABLED:  # whatever the method says
+        error = refuse(f"{SEALED_REFUSED_CODE}: integrity=sealed cannot be written until signatures can be verified")
+        error.reason_code = SEALED_REFUSED_CODE
+        raise error
     if not isinstance(attrs["target"], str) or not attrs["target"]:
         raise refuse("target must be a node_id")
     if attrs["detail_ref"] is not None and not isinstance(attrs["detail_ref"], str):
@@ -179,11 +190,11 @@ def check_node(record: Mapping[str, Any], target_record_hash: Callable[[str], st
     method = attrs["method"]
     if not (isinstance(method, str) and method) and not (isinstance(method, dict) and method):
         raise refuse("method must be a non-empty string or object")
+    if axis == "integrity" and value == "sealed":
+        _check_sealed_method(method, refuse)
     producer = attrs["producer"]
     if not isinstance(producer, dict) or set(producer) != set(PRODUCER_FIELDS) or not all(isinstance(producer[k], str) and producer[k] for k in PRODUCER_FIELDS):
         raise refuse(f"producer must be an object with the string fields {PRODUCER_FIELDS}")
-    if axis == "integrity" and value == "sealed":
-        _check_sealed_method(method, refuse)
     try:
         canonicalize(attrs)  # a float or an out-of-range integer is refused here, for this type only
     except JcsError as exc:
@@ -320,7 +331,7 @@ def consistency_report(index: AxisIndex) -> ConsistencyReport:
 
 
 __all__ = [
-    "AXES", "AXIS_VALUES", "BASIS_NO_RECORD", "BASIS_RECORDED", "CONFLICT", "PENDING", "AxisIndex", "AxisState",
+    "AXES", "AXIS_VALUES", "SEALED_REFUSED_CODE", "SEALED_WRITES_ENABLED", "BASIS_NO_RECORD", "BASIS_RECORDED", "CONFLICT", "PENDING", "AxisIndex", "AxisState",
     "AxisVerificationError", "ConsistencyReport", "EdgeRuleError", "axis_node_id", "build_node", "check_edge",
     "check_node", "consistency_report", "current_state",
     "input_hash", "producer_fingerprint", "result_hash",

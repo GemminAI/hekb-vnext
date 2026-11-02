@@ -49,6 +49,12 @@ SEALED_METHOD = {
 }
 
 
+@pytest.fixture
+def sealed_enabled(monkeypatch):
+    """The state after signature verification exists: sealed writes are checked by the method shape again."""
+    monkeypatch.setattr(axis, "SEALED_WRITES_ENABLED", True)
+
+
 def write(store, value, tag, *, axis_name="semantic", target="doc", method="m"):
     return store.write_axis_verification(axis_name=axis_name, value=value, method=method, target=target, producer=producer(tag))
 
@@ -86,7 +92,7 @@ def test_a_value_outside_the_axis_vocabulary_is_refused(store, axis_name, value)
 
 
 @pytest.mark.parametrize("axis_name", list(axis.AXIS_VALUES))
-def test_every_value_of_every_axis_is_accepted(store, axis_name):
+def test_every_value_of_every_axis_is_accepted(store, axis_name, sealed_enabled):
     for i, value in enumerate(axis.AXIS_VALUES[axis_name]):
         method = SEALED_METHOD if (axis_name, value) == ("integrity", "sealed") else "m"
         write(store, value, f"p{i}", axis_name=axis_name, method=method)
@@ -302,7 +308,7 @@ def test_the_node_id_and_the_logs_are_identical_in_two_new_processes(tmp_path):
 
 # ---- a projected hext_document -----------------------------------------------------------------------
 @needs_hext_docs
-def test_a_projected_hext_documents_integrity_is_pending_until_a_sealed_record_is_valid(tmp_path):
+def test_a_projected_hext_documents_integrity_is_pending_until_a_sealed_record_is_valid(tmp_path, sealed_enabled):
     layer = HextProjectionLayer(tmp_path)
     layer.rebuild([(SRC.read_bytes(), {})], resolve_session=lambda s: None)
     heads = layer.manifest()["heads"]
@@ -321,7 +327,7 @@ def test_a_projected_hext_documents_integrity_is_pending_until_a_sealed_record_i
 
 
 # ---- v0.3.4 section 4: the four corrections -----------------------------------------------------------
-def test_integrity_sealed_needs_both_references(store):
+def test_integrity_sealed_needs_both_references(store, sealed_enabled):
     ok = write(store, "sealed", "a", axis_name="integrity", method=SEALED_METHOD)
     s = store.axis_state("doc", "integrity")
     assert s.state == "sealed" and s.basis == "recorded" and [r["node_id"] for r in s.records] == [ok]
@@ -342,7 +348,7 @@ def test_integrity_sealed_needs_both_references(store):
     assert len([n for n in store.nodes() if n["node_type"] == "axis_verification"]) == 1
 
 
-def test_other_axes_and_values_keep_their_method_rules(store):
+def test_other_axes_and_values_keep_their_method_rules(store, sealed_enabled):
     write(store, "unverified", "a", axis_name="integrity", method="sha256 only")
     write(store, "invalid", "b", axis_name="integrity", method="m")
     write(store, "verified", "c", axis_name="semantic", method={"anything": 1})
@@ -422,3 +428,42 @@ def test_the_state_follows_attrs_target_not_the_edge(store):
     assert store.axis_state("doc", "semantic").state == "contradicted"
     assert store.axis_state("doc2", "semantic").state == "pending"
     assert nid in {r["node_id"] for r in store.axis_state("doc", "semantic").records}
+
+
+# ---- sealed writes are refused until signatures can be verified ---------------------------------------
+def test_the_switch_is_off_and_is_one_constant():
+    assert axis.SEALED_WRITES_ENABLED is False
+    assert axis.SEALED_REFUSED_CODE == "SIGNATURE_VERIFICATION_NOT_IMPLEMENTED"
+
+
+@pytest.mark.parametrize("method", [SEALED_METHOD, "m", {}, {"seal_recompute": {"ref": "r"}}])
+def test_a_sealed_write_is_refused_whatever_the_method_says(store, method):
+    with pytest.raises(AxisVerificationError, match="SIGNATURE_VERIFICATION_NOT_IMPLEMENTED") as caught:
+        write(store, "sealed", "a", axis_name="integrity", method=method)
+    assert caught.value.reason_code == "SIGNATURE_VERIFICATION_NOT_IMPLEMENTED"
+    assert not [n for n in store.nodes() if n["node_type"] == "axis_verification"]
+    assert store.axis_state("doc", "integrity").state == "pending"
+
+
+def test_the_node_check_itself_refuses_a_hand_written_sealed_record(store, sealed_enabled, monkeypatch):
+    node = _node(store, axis="integrity", value="sealed", method=SEALED_METHOD)
+    monkeypatch.setattr(axis, "SEALED_WRITES_ENABLED", False)
+    with pytest.raises(AxisVerificationError, match="SIGNATURE_VERIFICATION_NOT_IMPLEMENTED"):
+        _put(store, node)
+
+
+def test_other_integrity_values_and_other_axes_are_not_affected(store):
+    for value in ("unverified", "invalid", "not_applicable"):
+        write(store, value, value, axis_name="integrity")
+    write(store, "verified", "s", axis_name="semantic")
+    assert store.axis_state("doc", "integrity").state == "conflict"
+    assert store.axis_state("doc", "semantic").state == "verified"
+
+
+def test_with_the_switch_on_the_method_shape_check_works_as_before(store, sealed_enabled):
+    assert write(store, "sealed", "a", axis_name="integrity", method=SEALED_METHOD)
+    assert store.axis_state("doc", "integrity").state == "sealed"
+    for method in ("m", {}, {"seal_recompute": {"ref": "r"}}, {"seal_recompute": {"ref": "r"}, "signature_verify": {"ref": "r"}}):
+        with pytest.raises(AxisVerificationError, match="integrity=sealed|method must be") as caught:
+            write(store, "sealed", "b", axis_name="integrity", method=method)
+        assert caught.value.reason_code is None  # the shape refusals have no code; the switch does
