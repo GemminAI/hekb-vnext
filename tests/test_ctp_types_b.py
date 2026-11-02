@@ -739,9 +739,8 @@ def test_candidates_are_ordered_by_their_utf8_bytes():
 
 
 # ---- regression: the real data dirs ------------------------------------------------------------------------------
-EV = Path.home() / "vaults" / "20260124" / "experiment-evidence" / "GRAPH-ALIGN001"
-REAL = [EV / "graph_data", EV / "graph_data_v2", Path("/Volumes/SSD1TB/graph002_work/data"),
-        Path("/Volumes/SSD1TB/graph002_work/data_samecontent"), Path("/Volumes/SSD1TB/d71_work/hekb_lib")]
+# the same five real data dirs as the kind-map regression (tests/test_kindmap.py): one list, absent dirs are skipped
+from test_kindmap import REAL  # noqa: E402
 
 
 @pytest.mark.parametrize("src", REAL, ids=lambda p: p.name)
