@@ -22,6 +22,7 @@ from typing import Any
 
 from graph.chainlog import ChainLog
 from graph.guard import GraphLock, Ledger, PeerNodes, edge_key, node_key, put
+from graph.kindmap import check_stored_kind
 from graph.model import GraphError
 
 SCHEMA = "hextproj/1"
@@ -260,7 +261,7 @@ class HextProjectionLayer:
             for raw, meta in parsed:
                 p = project_document(raw, resolve_session=resolve_session, known_doc_hashes=hashes, known_claims=claims, **meta)
                 for n in p["nodes"]:
-                    put(lock, node_ledger, n, peers=[main_nodes])
+                    put(lock, node_ledger, n, peers=[main_nodes], check=check_stored_kind)
                 for e in p["edges"]:
                     put(lock, edge_ledger, e)
                 for u in p["unresolved"]:

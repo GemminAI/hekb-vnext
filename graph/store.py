@@ -13,6 +13,7 @@ from typing import Any
 
 from graph.chainlog import ChainLog
 from graph.guard import GraphLock, Ledger, PeerNodes, edge_key, node_key, put
+from graph.kindmap import check_stored_kind
 from graph.model import validate_edge, validate_node
 
 
@@ -51,7 +52,7 @@ class GraphStore:
             "attrs": attrs or {},
         }
         validate_node(node, v01=self.v01)
-        return put(self._lock, self._nodes, node, peers=[self._layer_nodes])
+        return put(self._lock, self._nodes, node, peers=[self._layer_nodes], check=check_stored_kind)
 
     def add_edge(self, type_: str, src: str, dst: str, attrs: dict[str, Any] | None = None) -> bool:
         edge = {"type": type_, "src": src, "dst": dst, "attrs": attrs or {}}

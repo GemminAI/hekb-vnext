@@ -162,11 +162,14 @@ def put(
     record: dict[str, Any],
     *,
     peers: Sequence[PeerNodes] = (),
+    check: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     """Write ``record`` unless it is already stored. True if appended, False if idempotent.
 
     Raises ``CollisionError`` if the identity exists, here or (for a node) in a peer log,
-    with a different content hash.
+    with a different content hash. ``check`` (for nodes: the stored-kind rule of
+    ``graph.kindmap``) is applied to a record that would be appended, and so to every new
+    write on both entrances; a record already stored is not new.
     """
     key = ledger.key_of(record)
     digest = record_hash(record)
@@ -177,6 +180,8 @@ def put(
             if stored == digest:
                 return False
             raise CollisionError(ledger.what, key, stored, digest, str(ledger.log.path))
+        if check is not None:
+            check(record)
         for peer in peers:
             other = peer.lookup(key)
             if other is not None and other != digest:
