@@ -12,8 +12,9 @@ from typing import Any, Final
 #: What a node says. ``observation``: something measured or recorded. ``claim``: an assertion made
 #: from observations (not written in v0.1). ``evaluation``: a judgement against content, evidence,
 #: intent or outcome (not written in v0.1). ``interpretation``: the D-70 word, stored only by
-#: ``axis_verification`` (graph/kindmap.py); v0.1 mode still refuses it.
-KINDS: Final = ("observation", "claim", "evaluation", "interpretation")
+#: ``axis_verification`` and the CTP interpretations; ``selection`` and ``outcome``: the other D-70 words, stored
+#: only by the CTP types (graph/ctp.py). v0.1 mode still refuses all of them.
+KINDS: Final = ("observation", "claim", "evaluation", "interpretation", "selection", "outcome")
 
 #: How far a node has been checked.
 #:   unverified        written, no check was made (or the check could not be made)
@@ -41,6 +42,10 @@ NODE_TYPES: Final = (
     "trajectory", "causal_log", "source_text", "hext_kernel", "policy_set",
     "raw_log", "hext_document", "hext_claim", "verification",
     "axis_verification",  # CTP: a record of one axis' check of one target (graph/axis.py)
+    # CTP episode records, first half (graph/ctp.py)
+    "episode", "context_observation", "step_output",
+    "applicability", "carry_evidence", "cle_result", "compliance",
+    "plan", "governance", "outcome",
 )
 EDGE_TYPES: Final = (
     "has_causal_log",  # trajectory -> causal_log blob (token range)
@@ -58,6 +63,16 @@ EDGE_TYPES: Final = (
     "verifies",  # axis_verification -> the evidence/interpretation node it checked
     "supersedes",  # axis_verification -> an earlier axis_verification (same target, same axis)
     "corrects",  # axis_verification -> an earlier, wrong axis_verification (same target, same axis)
+    # CTP episode records, first half (graph/ctp.py)
+    "under_manifest",  # episode -> the HEXT source document of its experiment spec
+    "has_context",  # episode -> context_observation
+    "has_step",  # episode -> step_output
+    "retrieved",  # step_output (f1) -> the HEXT source document it retrieved
+    "interprets",  # applicability / carry_evidence / cle_result / compliance -> observation or evidence node
+    "selects",  # governance -> the plan it decided on
+    "considered",  # plan / governance -> a node it considered
+    "outcome_of",  # outcome -> episode, or -> plan / governance
+    "audits",  # independent compliance -> verifier compliance (same episode and level)
 )
 
 

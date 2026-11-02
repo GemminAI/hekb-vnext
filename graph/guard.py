@@ -155,24 +155,28 @@ class PeerNodes:
         self._stamp: tuple[int, int, int] | None = None
         self._hashes: dict[str, str] = {}
         self._types: dict[str, str] = {}
+        self._attrs: dict[str, dict[str, Any]] = {}  # attrs of the HEXT documents only (what edge rules read)
 
     def _load(self) -> None:
         try:
             stat = self.path.stat()
         except FileNotFoundError:
-            self._stamp, self._hashes, self._types = None, {}, {}
+            self._stamp, self._hashes, self._types, self._attrs = None, {}, {}, {}
             return
         stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
         if stamp != self._stamp:
             hashes: dict[str, str] = {}
             types: dict[str, str] = {}
+            attrs: dict[str, dict[str, Any]] = {}
             with self.path.open(encoding="utf-8") as handle:
                 for raw in handle:
                     record = json.loads(raw)["record"]
                     if node_key(record) not in hashes:
                         hashes[node_key(record)] = record_hash(record)
                         types[node_key(record)] = str(record.get("node_type"))
-            self._stamp, self._hashes, self._types = stamp, hashes, types
+                        if record.get("node_type") == "hext_document":
+                            attrs[node_key(record)] = record.get("attrs", {})
+            self._stamp, self._hashes, self._types, self._attrs = stamp, hashes, types, attrs
 
     def lookup(self, key: str) -> str | None:
         self._load()
@@ -181,6 +185,10 @@ class PeerNodes:
     def node_type(self, key: str) -> str | None:
         self._load()
         return self._types.get(key)
+
+    def attrs(self, key: str) -> dict[str, Any] | None:
+        self._load()
+        return self._attrs.get(key)
 
 
 def put(

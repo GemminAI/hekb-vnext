@@ -43,6 +43,17 @@ KIND_MAP: Final[Mapping[str, KindRule]] = {
     "hext_kernel": KindRule("observation", "evidence", "v0.3.3 s1"),
     "verification": KindRule("evaluation", "interpretation", "v0.3.3 s1"),
     "axis_verification": KindRule("interpretation", "interpretation", "v0.3.2 s2"),
+    # CTP episode records, first half (graph/ctp.py): the stored kind is the D-70 word of the class
+    "episode": KindRule("observation", "observation", "CTP v0.3 s3"),
+    "context_observation": KindRule("observation", "observation", "CTP v0.3 s3"),
+    "step_output": KindRule("observation", "observation", "CTP v0.3 s3"),
+    "applicability": KindRule("interpretation", "interpretation", "CTP v0.3 s3"),
+    "carry_evidence": KindRule("interpretation", "interpretation", "CTP v0.3 s3"),
+    "cle_result": KindRule("interpretation", "interpretation", "CTP v0.3 s3"),
+    "compliance": KindRule("interpretation", "interpretation", "CTP v0.3 s3"),
+    "plan": KindRule("selection", "selection", "CTP v0.3 s3"),
+    "governance": KindRule("selection", "selection", "CTP v0.3 s3"),
+    "outcome": KindRule("outcome", "outcome", "CTP v0.3 s3"),
     # not in the v0.3.3 table; decided by Tomo (see DECISION_A)
     "causal_log": KindRule("observation", "observation", DECISION_A),
     "source_text": KindRule("observation", "observation", DECISION_A),
