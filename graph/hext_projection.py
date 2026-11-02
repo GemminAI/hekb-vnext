@@ -22,6 +22,7 @@ from typing import Any
 
 from graph.chainlog import ChainLog
 from graph.guard import GraphLock, Ledger, PeerNodes, edge_key, node_key, put
+from graph.jcs import canonicalize
 from graph.kindmap import check_stored_kind
 from graph.model import GraphError
 
@@ -44,35 +45,7 @@ class ProjectionConflict(GraphError):
     """Inputs that cannot be merged without choosing (same content identity, different bytes or metadata)."""
 
 
-def _q(s: str) -> str:
-    out = ['"']
-    for ch in s:
-        o = ord(ch)
-        if 0xD800 <= o <= 0xDFFF:
-            raise GraphError("lone surrogate")
-        out.append({'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
-            ch, f"\\u{o:04x}" if o < 0x20 else ch))
-    out.append('"')
-    return "".join(out)
-
-
-def _enc(v: Any) -> str:
-    """RFC 8785 for the sealable subset (ints, strings, bool, null, arrays, objects); keys by UTF-16 code units."""
-    if v is None:
-        return "null"
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, str):
-        return _q(v)
-    if isinstance(v, list):
-        return "[" + ",".join(_enc(x) for x in v) + "]"
-    if isinstance(v, dict):
-        return "{" + ",".join(_q(k) + ":" + _enc(v[k]) for k in sorted(v, key=lambda k: k.encode("utf-16-be"))) + "}"
-    raise GraphError(f"not a sealable value: {type(v).__name__}")
+_enc = canonicalize  # the name tests/test_hext_projection.py imports; the implementation is graph.jcs
 
 
 def sealed_bytes(raw: bytes) -> bytes:
@@ -81,7 +54,7 @@ def sealed_bytes(raw: bytes) -> bytes:
     non-canonical form is refused (the projection never re-serialises a document to make it fit)."""
     b = raw[:-1] if raw.endswith(b"\n") else raw
     doc = _strict_load(b)
-    if _enc(doc).encode("utf-8") != b:
+    if canonicalize(doc).encode("utf-8") != b:
         raise GraphError("document bytes are not the sealed canonical form (JCS); refusing to re-serialise")
     return b
 
@@ -90,7 +63,7 @@ def _state_hash(doc: dict[str, Any]) -> str:
     d = json.loads(json.dumps(doc))
     d["final_seal"].pop("state_hash", None)
     d["final_seal"].pop("signature", None)
-    return "sha256:" + hashlib.sha256(_enc(d).encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(canonicalize(d).encode("utf-8")).hexdigest()
 
 
 def _strict_load(raw: bytes) -> dict[str, Any]:
