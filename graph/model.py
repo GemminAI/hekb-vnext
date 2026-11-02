@@ -11,8 +11,9 @@ from typing import Any, Final
 
 #: What a node says. ``observation``: something measured or recorded. ``claim``: an assertion made
 #: from observations (not written in v0.1). ``evaluation``: a judgement against content, evidence,
-#: intent or outcome (not written in v0.1).
-KINDS: Final = ("observation", "claim", "evaluation")
+#: intent or outcome (not written in v0.1). ``interpretation``: the D-70 word, stored only by
+#: ``axis_verification`` (graph/kindmap.py); v0.1 mode still refuses it.
+KINDS: Final = ("observation", "claim", "evaluation", "interpretation")
 
 #: How far a node has been checked.
 #:   unverified        written, no check was made (or the check could not be made)
@@ -39,6 +40,7 @@ VERIFICATION_STATUSES: Final = ("VERIFIED", "FAILED", "NOT_EVALUATED", "UNRESOLV
 NODE_TYPES: Final = (
     "trajectory", "causal_log", "source_text", "hext_kernel", "policy_set",
     "raw_log", "hext_document", "hext_claim", "verification",
+    "axis_verification",  # CTP: a record of one axis' check of one target (graph/axis.py)
 )
 EDGE_TYPES: Final = (
     "has_causal_log",  # trajectory -> causal_log blob (token range)
@@ -52,6 +54,10 @@ EDGE_TYPES: Final = (
     "time_relation",  # hext_claim -> hext_claim (a HEXT relations[] entry)
     "observation_ref",  # hext_document -> trajectory (only when the reference resolves)
     "derived_from",  # hext_document -> hext_document (provenance.derived_from, only when the target is present)
+    # CTP axis_verification (graph/axis.py)
+    "verifies",  # axis_verification -> the evidence/interpretation node it checked
+    "supersedes",  # axis_verification -> an earlier axis_verification (same target, same axis)
+    "corrects",  # axis_verification -> an earlier, wrong axis_verification (same target, same axis)
 )
 
 

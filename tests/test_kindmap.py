@@ -35,6 +35,7 @@ EXPECTED = {
     "hext_claim": ("observation", "evidence"),
     "hext_kernel": ("observation", "evidence"),
     "verification": ("evaluation", "interpretation"),
+    "axis_verification": ("interpretation", "interpretation"),
     "causal_log": ("observation", "observation"),
     "source_text": ("observation", "observation"),
     "policy_set": ("observation", "observation"),
@@ -63,7 +64,7 @@ def test_the_four_rows_decided_by_tomo_are_observations(tmp_path, node_type):
     assert {t for t, r in KIND_MAP.items() if r.d70_class == "evidence"} == {"hext_document", "hext_claim", "hext_kernel"}
 
 
-@pytest.mark.parametrize("node_type", sorted(EXPECTED))
+@pytest.mark.parametrize("node_type", sorted(set(EXPECTED) - {"axis_verification"}))  # its writes need the record shape of graph/axis.py: tests/test_axis_verification.py
 def test_a_write_with_the_stored_kind_passes_and_classifies(tmp_path, node_type):
     stored, cls = EXPECTED[node_type]
     s = GraphStore(tmp_path, v01=False)

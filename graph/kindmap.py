@@ -42,6 +42,7 @@ KIND_MAP: Final[Mapping[str, KindRule]] = {
     "hext_claim": KindRule("observation", "evidence", "v0.3.3 s1"),
     "hext_kernel": KindRule("observation", "evidence", "v0.3.3 s1"),
     "verification": KindRule("evaluation", "interpretation", "v0.3.3 s1"),
+    "axis_verification": KindRule("interpretation", "interpretation", "v0.3.2 s2"),
     # not in the v0.3.3 table; decided by Tomo (see DECISION_A)
     "causal_log": KindRule("observation", "observation", DECISION_A),
     "source_text": KindRule("observation", "observation", DECISION_A),

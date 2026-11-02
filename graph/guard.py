@@ -105,13 +105,27 @@ class GraphLock:
 class Ledger:
     """The identities stored in one chain log, kept current against other processes' appends."""
 
-    def __init__(self, log: ChainLog, key_of: Callable[[dict[str, Any]], str], what: str) -> None:
+    def __init__(
+        self,
+        log: ChainLog,
+        key_of: Callable[[dict[str, Any]], str],
+        what: str,
+        observe: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.log = log
         self.key_of = key_of
         self.what = what
+        self._observe = observe  # called once for every record the index takes in (a derived index)
         self._hashes: dict[str, str] = {}
         for record in log.records():
-            self._hashes.setdefault(key_of(record), record_hash(record))
+            self._take(record)
+
+    def _take(self, record: dict[str, Any]) -> None:
+        key = self.key_of(record)
+        if key not in self._hashes:
+            self._hashes[key] = record_hash(record)
+            if self._observe is not None:
+                self._observe(record)
 
     def refresh(self) -> None:
         """Index what other processes appended (call under the lock)."""
@@ -119,13 +133,15 @@ class Ledger:
         if self.log.reset_by_last_resync:  # the file was replaced: start over
             self._hashes = {}
         for record in records:
-            self._hashes.setdefault(self.key_of(record), record_hash(record))
+            self._take(record)
 
     def lookup(self, key: str) -> str | None:
         return self._hashes.get(key)
 
-    def note(self, key: str, digest: str) -> None:
+    def note(self, key: str, digest: str, record: dict[str, Any] | None = None) -> None:
         self._hashes[key] = digest
+        if record is not None and self._observe is not None:
+            self._observe(record)
 
 
 class PeerNodes:
@@ -138,22 +154,33 @@ class PeerNodes:
         self.path = path
         self._stamp: tuple[int, int, int] | None = None
         self._hashes: dict[str, str] = {}
+        self._types: dict[str, str] = {}
 
-    def lookup(self, key: str) -> str | None:
+    def _load(self) -> None:
         try:
             stat = self.path.stat()
         except FileNotFoundError:
-            self._stamp, self._hashes = None, {}
-            return None
+            self._stamp, self._hashes, self._types = None, {}, {}
+            return
         stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
         if stamp != self._stamp:
             hashes: dict[str, str] = {}
+            types: dict[str, str] = {}
             with self.path.open(encoding="utf-8") as handle:
                 for raw in handle:
                     record = json.loads(raw)["record"]
-                    hashes.setdefault(node_key(record), record_hash(record))
-            self._stamp, self._hashes = stamp, hashes
+                    if node_key(record) not in hashes:
+                        hashes[node_key(record)] = record_hash(record)
+                        types[node_key(record)] = str(record.get("node_type"))
+            self._stamp, self._hashes, self._types = stamp, hashes, types
+
+    def lookup(self, key: str) -> str | None:
+        self._load()
         return self._hashes.get(key)
+
+    def node_type(self, key: str) -> str | None:
+        self._load()
+        return self._types.get(key)
 
 
 def put(
@@ -187,5 +214,5 @@ def put(
             if other is not None and other != digest:
                 raise CollisionError(ledger.what, key, other, digest, str(peer.path))
         ledger.log.append(record)
-        ledger.note(key, digest)
+        ledger.note(key, digest, record)
         return True
