@@ -43,6 +43,12 @@ def store(tmp_path):
     return s
 
 
+SEALED_METHOD = {
+    "seal_recompute": {"ref": "blob:recomputed-seal"},
+    "signature_verify": {"ref": "blob:signature-check", "key_ref": "key:hext-signing-1"},
+}
+
+
 def write(store, value, tag, *, axis_name="semantic", target="doc", method="m"):
     return store.write_axis_verification(axis_name=axis_name, value=value, method=method, target=target, producer=producer(tag))
 
@@ -82,7 +88,8 @@ def test_a_value_outside_the_axis_vocabulary_is_refused(store, axis_name, value)
 @pytest.mark.parametrize("axis_name", list(axis.AXIS_VALUES))
 def test_every_value_of_every_axis_is_accepted(store, axis_name):
     for i, value in enumerate(axis.AXIS_VALUES[axis_name]):
-        write(store, value, f"p{i}", axis_name=axis_name)
+        method = SEALED_METHOD if (axis_name, value) == ("integrity", "sealed") else "m"
+        write(store, value, f"p{i}", axis_name=axis_name, method=method)
     assert store.axis_state("doc", axis_name).state == "conflict"
 
 
@@ -90,28 +97,29 @@ def test_every_value_of_every_axis_is_accepted(store, axis_name):
 def test_conflict_and_how_it_is_resolved(store):
     a, b = write(store, "verified", "a"), write(store, "contradicted", "b")
     s = store.axis_state("doc", "semantic")
-    assert s.state == "conflict" and [r["node_id"] for r in s.valid] == sorted([a, b])
+    assert s.state == "conflict" and [r["node_id"] for r in s.records] == sorted([a, b])
     c = write(store, "verified", "c")
     store.replace_axis_verification(c, a)  # C supersedes A only
     s = store.axis_state("doc", "semantic")
-    assert s.state == "conflict" and {r["node_id"] for r in s.valid} == {b, c}
+    assert s.state == "conflict" and {r["node_id"] for r in s.records} == {b, c}
     d = write(store, "verified", "d")
     store.replace_axis_verification(d, b)
     store.replace_axis_verification(d, c)  # D supersedes B and C
     s = store.axis_state("doc", "semantic")
-    assert s.state == "verified" and [r["node_id"] for r in s.valid] == [d]
+    assert s.state == "verified" and [r["node_id"] for r in s.records] == [d]
 
 
 def test_no_record_is_pending_equal_records_give_the_value_and_corrects_removes_a_record(store):
     assert store.axis_state("doc", "semantic").state == "pending"
-    assert store.axis_state("doc", "semantic").valid == ()
+    assert store.axis_state("doc", "semantic").records == ()
+    assert store.axis_state("doc", "semantic").basis == "no_record"
     a, b = write(store, "verified", "a"), write(store, "verified", "b")
     assert store.axis_state("doc", "semantic").state == "verified"
     wrong = write(store, "contradicted", "w")
     assert store.axis_state("doc", "semantic").state == "conflict"
     store.replace_axis_verification(a, wrong, correction=True)  # a corrects the mistake
     s = store.axis_state("doc", "semantic")
-    assert s.state == "verified" and {r["node_id"] for r in s.valid} == {a, b}
+    assert s.state == "verified" and {r["node_id"] for r in s.records} == {a, b}
     assert any(e["type"] == "corrects" for e in store.edges())
 
 
@@ -138,7 +146,7 @@ def test_state_is_read_by_another_store_object_on_the_same_dir(store, tmp_path):
     assert other.axis_state("doc", "semantic").state == "verified"
     write(store, "contradicted", "b")
     assert other.axis_state("doc", "semantic").state == "conflict"
-    assert a in {r["node_id"] for r in other.axis_state("doc", "semantic").valid}
+    assert a in {r["node_id"] for r in other.axis_state("doc", "semantic").records}
 
 
 # ---- edge rules -------------------------------------------------------------------------------------
@@ -304,9 +312,113 @@ def test_a_projected_hext_documents_integrity_is_pending_until_a_sealed_record_i
     assert d70_class(next(n for n in layer.nodes() if n["node_id"] == doc)) == "evidence"
     unver = s.write_axis_verification(axis_name="integrity", value="unverified", method="sha256 only; the signature is not verified", target=doc, producer=producer())
     assert s.axis_state(doc, "integrity").state == "unverified"  # SHA-256 equal is not "sealed"
-    sealed = s.write_axis_verification(axis_name="integrity", value="sealed", method={"seal_recompute": True, "signature_verified": True}, target=doc, producer=producer("b"))
+    sealed = s.write_axis_verification(axis_name="integrity", value="sealed", method=SEALED_METHOD, target=doc, producer=producer("b"))
     assert s.axis_state(doc, "integrity").state == "conflict"
     s.replace_axis_verification(sealed, unver)
     assert s.axis_state(doc, "integrity").state == "sealed"
     assert HextProjectionLayer(tmp_path).manifest()["heads"] == heads  # the projection layer was not touched
     assert not [e for e in layer.edges() if e["type"] == "verifies"]
+
+
+# ---- v0.3.4 section 4: the four corrections -----------------------------------------------------------
+def test_integrity_sealed_needs_both_references(store):
+    ok = write(store, "sealed", "a", axis_name="integrity", method=SEALED_METHOD)
+    s = store.axis_state("doc", "integrity")
+    assert s.state == "sealed" and s.basis == "recorded" and [r["node_id"] for r in s.records] == [ok]
+    bad_methods = [
+        "seal recomputed and signature verified",  # a string
+        {},
+        {"seal_recompute": {"ref": "r"}},  # one reference only
+        {"signature_verify": {"ref": "r", "key_ref": "k"}},  # the other one only
+        {"seal_recompute": {"ref": "r"}, "signature_verify": {"ref": "r"}},  # no key_ref
+        {"seal_recompute": {"ref": "r"}, "signature_verify": {"key_ref": "k"}},  # no ref
+        {"seal_recompute": {"ref": ""}, "signature_verify": {"ref": "r", "key_ref": "k"}},
+        {"seal_recompute": True, "signature_verify": True},
+        {"seal_recompute": {"ref": 1}, "signature_verify": {"ref": "r", "key_ref": "k"}},
+    ]
+    for i, method in enumerate(bad_methods):
+        with pytest.raises(AxisVerificationError, match="integrity=sealed|method must be"):
+            write(store, "sealed", f"b{i}", axis_name="integrity", method=method)
+    assert len([n for n in store.nodes() if n["node_type"] == "axis_verification"]) == 1
+
+
+def test_other_axes_and_values_keep_their_method_rules(store):
+    write(store, "unverified", "a", axis_name="integrity", method="sha256 only")
+    write(store, "invalid", "b", axis_name="integrity", method="m")
+    write(store, "verified", "c", axis_name="semantic", method={"anything": 1})
+    assert write(store, "sealed", "d", axis_name="integrity", method=SEALED_METHOD)  # but sealed alone is checked
+
+
+def test_a_replacement_cycle_is_refused_and_others_pass(store):
+    a, b, c = (write(store, "verified", t) for t in "abc")
+    assert store.replace_axis_verification(a, b) is True  # a replaces b
+    with pytest.raises(EdgeRuleError, match="cycle"):
+        store.replace_axis_verification(b, a)  # b replaces a: mutual
+    with pytest.raises(EdgeRuleError, match="cycle"):
+        store.replace_axis_verification(b, a, correction=True)  # corrects counts the same
+    assert store.replace_axis_verification(b, c) is True  # b replaces c: a -> b -> c
+    with pytest.raises(EdgeRuleError, match="cycle"):
+        store.replace_axis_verification(c, a)  # c replaces a: a -> b -> c -> a
+    d = write(store, "contradicted", "d")
+    assert store.replace_axis_verification(d, a) is True  # d -> a -> b -> c: still acyclic
+    assert store.replace_axis_verification(d, c) is True  # a second path to c, no cycle
+    with pytest.raises(EdgeRuleError, match="itself"):
+        store.replace_axis_verification(a, a)
+    assert store.axis_consistency().cyclic == ()
+    assert store.axis_state("doc", "semantic").state == "contradicted"  # only d is left
+
+
+def test_a_three_record_cycle_across_supersedes_and_corrects_is_refused(store):
+    a, b, c = (write(store, "verified", t) for t in "abc")
+    store.replace_axis_verification(a, b)
+    store.replace_axis_verification(b, c, correction=True)
+    with pytest.raises(EdgeRuleError, match="cycle"):
+        store.replace_axis_verification(c, a, correction=True)
+
+
+def test_an_existing_cycle_is_reported_not_raised(tmp_path):
+    """Logs written before the rule can hold a cycle: reading must not break, the report names the records."""
+    s = GraphStore(tmp_path, v01=False)
+    s.add_node("doc", "hext_document")
+    a, b = write(s, "verified", "a"), write(s, "contradicted", "b")
+    s.edges_log.append({"type": "supersedes", "src": a, "dst": b, "attrs": {}})  # as an old writer could have
+    s.edges_log.append({"type": "supersedes", "src": b, "dst": a, "attrs": {}})
+    fresh = GraphStore(tmp_path, v01=False)
+    state = fresh.axis_state("doc", "semantic")  # no exception
+    assert (state.state, state.basis, state.records) == ("pending", "no_record", ())
+    assert fresh.axis_consistency().cyclic == tuple(sorted([a, b])) and not fresh.axis_consistency().ok
+
+
+def test_basis_tells_no_record_from_a_recorded_pending(store):
+    none = store.axis_state("doc", "semantic")
+    assert (none.state, none.basis) == ("pending", "no_record")
+    pending = write(store, "pending", "a")
+    s = store.axis_state("doc", "semantic")
+    assert (s.state, s.basis) == ("pending", "recorded") and [r["node_id"] for r in s.records] == [pending]
+    write(store, "verified", "b")
+    assert store.axis_state("doc", "semantic").basis == "recorded"  # conflict is recorded too
+    assert store.axis_state("doc", "semantic").state == "conflict"
+    assert store.axis_state("doc", "integrity").basis == "no_record"  # integrity has no value "pending": only no_record reads so
+
+
+def test_a_record_without_its_verifies_edge_is_read_and_reported_until_the_write_is_repeated(store):
+    node = _node(store)  # the node alone: what is left if the process stops between the two writes
+    _put(store, node)
+    s = store.axis_state("doc", "semantic")
+    assert s.state == "verified" and s.basis == "recorded" and [r["node_id"] for r in s.records] == [node["node_id"]]
+    report = store.axis_consistency()
+    assert report.missing_verifies == (node["node_id"],) and not report.ok
+    assert not [e for e in store.edges() if e["type"] == "verifies"]
+    again = store.write_axis_verification(axis_name="semantic", value="verified", method="m", target="doc", producer=producer())
+    assert again == node["node_id"]
+    assert store.axis_consistency().ok and store.axis_consistency().missing_verifies == ()
+    assert len([e for e in store.edges() if e["type"] == "verifies"]) == 1
+    assert store.axis_state("doc", "semantic").state == "verified"
+
+
+def test_the_state_follows_attrs_target_not_the_edge(store):
+    """A verifies edge is an index: the record is read for the target in its attrs whatever edges exist."""
+    nid = write(store, "contradicted", "a", target="doc")
+    assert store.axis_state("doc", "semantic").state == "contradicted"
+    assert store.axis_state("doc2", "semantic").state == "pending"
+    assert nid in {r["node_id"] for r in store.axis_state("doc", "semantic").records}

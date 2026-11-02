@@ -7,9 +7,13 @@ A record is a node (``node_type="axis_verification"``, ``kind="interpretation"``
 method or evaluator) or ``corrects`` (a mistake) older ones of the same target and axis. The *current state*
 of ``(target, axis)`` is computed from the records nobody has replaced:
 
-  none               -> ``pending``
-  all the same value -> that value
+  none               -> ``pending`` with basis ``no_record``
+  all the same value -> that value (basis ``recorded``; so is a recorded value ``pending``)
   different values   -> ``conflict`` (every valid record is returned; none is chosen, and no clock is read)
+
+The target of a record is its ``attrs.target``; the ``verifies`` edge is an index. A record whose edge
+was never written (the node and the edge are two writes) is still read, and ``consistency_report`` lists it.
+Supersedes/corrects edges of one target and axis must stay acyclic: an edge that would close a cycle is refused.
 
 Node record (the existing five fields; the CTP fields live in ``attrs``)::
 
@@ -58,6 +62,8 @@ CONFLICT: Final = "conflict"
 REPLACING_EDGES: Final = ("supersedes", "corrects")
 VERIFIABLE_CLASSES: Final = ("evidence", "interpretation")
 PRODUCER_FIELDS: Final = ("component", "version", "config_sha256")
+BASIS_NO_RECORD: Final = "no_record"
+BASIS_RECORDED: Final = "recorded"
 
 
 class AxisVerificationError(GraphError):
@@ -126,6 +132,24 @@ def build_node(
     }
 
 
+def _nonempty(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _check_sealed_method(method: Any, refuse: Callable[[str], AxisVerificationError]) -> None:
+    """v0.3.4 s4: ``integrity=sealed`` needs the references of both a seal recomputation and a signature check."""
+    shape = (
+        '{"seal_recompute": {"ref": ...}, "signature_verify": {"ref": ..., "key_ref": ...}}'
+    )
+    if not isinstance(method, dict):
+        raise refuse(f"integrity=sealed needs a method of the form {shape}")
+    recompute, signature = method.get("seal_recompute"), method.get("signature_verify")
+    if not (isinstance(recompute, dict) and _nonempty(recompute.get("ref"))):
+        raise refuse(f"integrity=sealed needs method.seal_recompute.ref: {shape}")
+    if not (isinstance(signature, dict) and _nonempty(signature.get("ref")) and _nonempty(signature.get("key_ref"))):
+        raise refuse(f"integrity=sealed needs method.signature_verify.ref and .key_ref: {shape}")
+
+
 def check_node(record: Mapping[str, Any], target_record_hash: Callable[[str], str | None]) -> None:
     """Refuse a new axis_verification node that breaks its rules (called under the graph lock)."""
     node_id = str(record.get("node_id"))
@@ -158,6 +182,8 @@ def check_node(record: Mapping[str, Any], target_record_hash: Callable[[str], st
     producer = attrs["producer"]
     if not isinstance(producer, dict) or set(producer) != set(PRODUCER_FIELDS) or not all(isinstance(producer[k], str) and producer[k] for k in PRODUCER_FIELDS):
         raise refuse(f"producer must be an object with the string fields {PRODUCER_FIELDS}")
+    if axis == "integrity" and value == "sealed":
+        _check_sealed_method(method, refuse)
     try:
         canonicalize(attrs)  # a float or an out-of-range integer is refused here, for this type only
     except JcsError as exc:
@@ -180,6 +206,8 @@ class AxisIndex:
         self.records: dict[str, dict[str, Any]] = {}  # node_id -> record of every axis_verification
         self.by_target_axis: dict[tuple[str, str], list[str]] = defaultdict(list)
         self.replaced_by: dict[str, set[str]] = defaultdict(set)  # old id -> the ids that supersede/correct it
+        self.replaces: dict[str, set[str]] = defaultdict(set)  # new id -> the ids it supersedes/corrects
+        self.verifies: set[tuple[str, str]] = set()  # (axis_verification id, node it verifies)
 
     def observe_node(self, record: dict[str, Any]) -> None:
         if record.get("node_type") == NODE_TYPE:
@@ -190,6 +218,22 @@ class AxisIndex:
     def observe_edge(self, record: dict[str, Any]) -> None:
         if record.get("type") in REPLACING_EDGES:
             self.replaced_by[record["dst"]].add(record["src"])
+            self.replaces[record["src"]].add(record["dst"])
+        elif record.get("type") == "verifies":
+            self.verifies.add((record["src"], record["dst"]))
+
+    def reaches(self, start: str, goal: str) -> bool:
+        """Is ``goal`` reached from ``start`` by following "replaces" edges (start replaces ... replaces goal)?"""
+        seen: set[str] = set()
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node == goal:
+                return True
+            if node not in seen:
+                seen.add(node)
+                stack.extend(self.replaces.get(node, ()))
+        return False
 
 
 def check_edge(
@@ -229,6 +273,8 @@ def check_edge(
     for field in ("target", "axis"):
         if start["attrs"][field] != end["attrs"][field]:
             raise refuse(f"the two records have a different {field} ({start['attrs'][field]!r} vs {end['attrs'][field]!r})")
+    if index.reaches(dst, src):  # dst already (directly or through others) replaces src: this edge would close a cycle
+        raise refuse("this edge would close a cycle of replacements (a record cannot, even indirectly, replace a record that replaced it)")
 
 
 @dataclass(frozen=True)
@@ -236,27 +282,46 @@ class AxisState:
     target: str
     axis: str
     state: str  # a value of the axis, "pending" or "conflict"
-    valid: tuple[dict[str, Any], ...]  # the valid records, sorted by node_id (all of them, also when state is conflict)
+    basis: str  # "no_record" (no valid record: nothing was recorded, or all were replaced) or "recorded"
+    records: tuple[dict[str, Any], ...]  # the valid records, sorted by node_id (all of them, also when state is conflict)
 
 
 def current_state(index: AxisIndex, target: str, axis: str) -> AxisState:
-    """The state of (target, axis) from the records nobody has superseded or corrected."""
+    """The state of (target, axis) from the records nobody has superseded or corrected.
+
+    The target of a record is ``attrs.target``; no edge is read except the replacing ones.
+    """
     if axis not in AXIS_VALUES:
         raise AxisVerificationError(f"axis {axis!r} is not one of {AXES}")
     ids = index.by_target_axis.get((target, axis), [])
     valid = tuple(index.records[i] for i in sorted(set(ids)) if not index.replaced_by.get(i))
     values = {r["attrs"]["value"] for r in valid}
     if not valid:
-        state = PENDING
-    elif len(values) == 1:
-        state = next(iter(values))
-    else:
-        state = CONFLICT
-    return AxisState(target, axis, state, valid)
+        return AxisState(target, axis, PENDING, BASIS_NO_RECORD, valid)
+    state = next(iter(values)) if len(values) == 1 else CONFLICT
+    return AxisState(target, axis, state, BASIS_RECORDED, valid)
+
+
+@dataclass(frozen=True)
+class ConsistencyReport:
+    missing_verifies: tuple[str, ...]  # axis_verification records without a verifies edge to their attrs.target
+    cyclic: tuple[str, ...]  # records on a cycle of supersedes/corrects (only data written before the cycle rule)
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing_verifies and not self.cyclic
+
+
+def consistency_report(index: AxisIndex) -> ConsistencyReport:
+    """Report, without changing anything, the records the two-step write left half done and any replacement cycle."""
+    missing = sorted(i for i, r in index.records.items() if (i, r["attrs"]["target"]) not in index.verifies)
+    cyclic = sorted(i for i in index.replaces if any(index.reaches(d, i) for d in index.replaces[i]))
+    return ConsistencyReport(tuple(missing), tuple(cyclic))
 
 
 __all__ = [
-    "AXES", "AXIS_VALUES", "CONFLICT", "PENDING", "AxisIndex", "AxisState", "AxisVerificationError",
-    "EdgeRuleError", "axis_node_id", "build_node", "check_edge", "check_node", "current_state",
+    "AXES", "AXIS_VALUES", "BASIS_NO_RECORD", "BASIS_RECORDED", "CONFLICT", "PENDING", "AxisIndex", "AxisState",
+    "AxisVerificationError", "ConsistencyReport", "EdgeRuleError", "axis_node_id", "build_node", "check_edge",
+    "check_node", "consistency_report", "current_state",
     "input_hash", "producer_fingerprint", "result_hash",
 ]

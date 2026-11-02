@@ -129,8 +129,15 @@ class GraphStore:
         return self.add_edge("corrects" if correction else "supersedes", new_id, old_id)
 
     def axis_state(self, target: str, axis_name: str) -> axis.AxisState:
-        """The current state of (target, axis): a value, ``pending`` or ``conflict`` (graph/axis.py)."""
+        """The state of (target, axis): ``state`` (a value, ``pending`` or ``conflict``), ``basis`` (``no_record`` or ``recorded``) and ``records`` (graph/axis.py)."""
         with self._lock:
             self._nodes.refresh()
             self._edges.refresh()
             return axis.current_state(self._axis, target, axis_name)
+
+    def axis_consistency(self) -> axis.ConsistencyReport:
+        """axis_verification records without their ``verifies`` edge, and records on a replacement cycle."""
+        with self._lock:
+            self._nodes.refresh()
+            self._edges.refresh()
+            return axis.consistency_report(self._axis)
