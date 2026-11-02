@@ -10,8 +10,9 @@ One table, two columns:
   ``evaluation``, ``observation`` kinds) classify correctly and are not rewritten.
 
 ``KINDS``, ``V01_ALLOWED`` and ``validate_node`` in ``graph/model.py`` are unchanged.
-Rows marked "to confirm" are not in the v0.3.3 section 1 table; their class is read from what the
-code does with them.
+The four rows that v0.3.3 section 1 does not list (causal_log, raw_log, source_text, policy_set) were
+decided by Tomo on 2026-11-03 (option A): D-70 Evidence is HEXT only, so they are observations; a
+declaration becomes evidence when it is sealed as a HEXT v2 source.
 """
 
 from __future__ import annotations
@@ -30,18 +31,22 @@ class KindRule(NamedTuple):
     source: str  # where the row comes from (documentation only)
 
 
+DECISION_A: Final = (
+    "Tomo decision 2026-11-03 (option A: D-70 Evidence is HEXT only; "
+    "a declaration is evidence when sealed as a HEXT v2 source)"
+)
+
 KIND_MAP: Final[Mapping[str, KindRule]] = {
     "trajectory": KindRule("observation", "observation", "v0.3.3 s1"),
     "hext_document": KindRule("observation", "evidence", "v0.3.3 s1"),
     "hext_claim": KindRule("observation", "evidence", "v0.3.3 s1"),
     "hext_kernel": KindRule("observation", "evidence", "v0.3.3 s1"),
     "verification": KindRule("evaluation", "interpretation", "v0.3.3 s1"),
-    # to confirm: not in the v0.3.3 table; GRAPH_SEARCH_v0_1.md s2.4 reads these as Observation
-    "causal_log": KindRule("observation", "observation", "to confirm (GRAPH_SEARCH s2.4)"),
-    "source_text": KindRule("observation", "observation", "to confirm (GRAPH_SEARCH s2.4)"),
-    "policy_set": KindRule("observation", "observation", "to confirm (GRAPH_SEARCH s2.4)"),
-    # to confirm: in no document; only tools/graph_align001.py writes it (a pointer to a raw log)
-    "raw_log": KindRule("observation", "observation", "to confirm (no document)"),
+    # not in the v0.3.3 table; decided by Tomo (see DECISION_A)
+    "causal_log": KindRule("observation", "observation", DECISION_A),
+    "source_text": KindRule("observation", "observation", DECISION_A),
+    "policy_set": KindRule("observation", "observation", DECISION_A),
+    "raw_log": KindRule("observation", "observation", DECISION_A),
 }
 
 

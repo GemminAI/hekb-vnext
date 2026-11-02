@@ -28,7 +28,7 @@ SRC = EX / "source-three-sentences.hext2.json"
 ANN = EX / "annotation-three-sentences.hext2.json"
 needs_hext_docs = pytest.mark.skipif(not SRC.exists(), reason="P0 example documents absent")
 
-# v0.3.3 section 1 plus the rows marked "to confirm", written out independently of the module.
+# v0.3.3 section 1 plus the four rows Tomo decided (2026-11-03, option A), written out independently of the module.
 EXPECTED = {
     "trajectory": ("observation", "observation"),
     "hext_document": ("observation", "evidence"),
@@ -46,6 +46,21 @@ def test_the_table_is_the_v033_table_and_covers_every_node_type():
     assert {t: (r.stored_kind, r.d70_class) for t, r in KIND_MAP.items()} == EXPECTED
     assert set(KIND_MAP) == set(NODE_TYPES)
     assert all(r.d70_class in D70_CLASSES and r.stored_kind in KINDS for r in KIND_MAP.values())
+
+
+@pytest.mark.parametrize("node_type", ["causal_log", "raw_log", "source_text", "policy_set"])
+def test_the_four_rows_decided_by_tomo_are_observations(tmp_path, node_type):
+    """Tomo, 2026-11-03, option A: D-70 Evidence is HEXT only; these four are not listed in v0.3.3 s1."""
+    rule = KIND_MAP[node_type]
+    assert (rule.stored_kind, rule.d70_class) == ("observation", "observation")
+    assert rule.source.startswith("Tomo decision 2026-11-03 (option A: D-70 Evidence is HEXT only")
+    assert "to confirm" not in rule.source
+    s = GraphStore(tmp_path, v01=False)
+    assert s.add_node("n", node_type, kind="observation") is True
+    assert d70_class(s.nodes()[0]) == "observation"
+    with pytest.raises(KindMapError):
+        s.add_node("m", node_type, kind="evaluation")
+    assert {t for t, r in KIND_MAP.items() if r.d70_class == "evidence"} == {"hext_document", "hext_claim", "hext_kernel"}
 
 
 @pytest.mark.parametrize("node_type", sorted(EXPECTED))
