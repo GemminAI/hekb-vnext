@@ -1,4 +1,4 @@
-"""CTP episode records, first half (CTP001 Stage D): ten node types and their edges.
+"""CTP episode records (CTP001 Stage D): the first half's ten node types, then assignment and experience, and their edges.
 
 CTP common data model v0.3 (sections 2-4, 7, 8) with v0.3.1-v0.3.4; v0.3.4 decides where things live:
 
@@ -23,7 +23,12 @@ compliance            interpretation   a compliance judgement at level L1/L2/L3/
 plan                  selection        the plan the Planner chose (no probability: unobserved)
 governance            selection        admit or hold before execution (no probability at all)
 outcome               outcome          the result: two-axis class and its parts (no reward)
+assignment            selection        the condition drawn for an episode (graph/selection.py; recomputed)
+experience            selection        the ordered past episodes/outcomes drawn for a slate (recomputed)
 ====================  ===============  ===========================================================
+
+assignment and experience have no ``observed_at``; their ``input_facts`` are exactly their definition (what the
+recomputation reads, v0.3.1 section 2) and an experience's one input node is the context_observation of its episode.
 
 ``node_id`` (v0.3 section 4):
 
@@ -46,6 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from graph import selection
 from graph.axis import PRODUCER_FIELDS, producer_fingerprint
 from graph.blobs import blob_path
 from graph.jcs import JcsError, canonical_bytes, canonicalize
@@ -172,15 +178,41 @@ SPECS: Final[Mapping[str, Spec]] = {
         ("episode_id",),
         OUTCOME_FIELDS,
     ),
+    # second half (graph/selection.py): selections that draw; their record is recomputed from the candidates blob
+    "assignment": Spec(
+        "selection",
+        (
+            "experiment_spec_hash", "item_id", "replicate", "assignment_candidates_ref", "assignment_candidate_set_hash",
+            "assignment_algorithm", "assignment_stratum", "assignment_rng", "assignment_policy_id", "assignment_policy_version",
+            "condition", "assignment_probability", "probability_source",
+        ),
+        (),
+        ("experiment_spec_hash", "item_id", "replicate"),
+        ("condition", "assignment_probability"),
+    ),
+    "experience": Spec(
+        "selection",
+        (
+            "episode_id", "candidates_ref", "candidate_set_hash", "selection_algorithm", "k", "replacement", "order_considered",
+            "ordering_rule", "rng", "selection_policy_id", "selection_policy_version", "selection_policy_fingerprint",
+            "selected_ids", "conditional_selection_probabilities", "slate_probability", "arm_id", "presentation_mode",
+            "presentation_format", "retrieval_space", "probability_source",
+        ),
+        (),
+        ("episode_id",),
+        ("arm_id", "selected_ids", "conditional_selection_probabilities", "slate_probability"),
+    ),
 }
 CTP_NODE_TYPES: Final = tuple(SPECS)
 COMMON: Final = ("schema", "refs", "producer", "observed_at")
 JUDGEMENT_INPUTS: Final = ("input_nodes", "input_facts", "input_hash")
 CTP_EDGE_TYPES: Final = (
     "under_manifest", "has_context", "has_step", "retrieved", "interprets", "selects", "considered", "outcome_of", "audits",
+    "presented_to",
 )
 INTERPRETATIONS: Final = ("applicability", "carry_evidence", "cle_result", "compliance")
-SELECTIONS: Final = ("plan", "governance")
+SELECTIONS: Final = ("plan", "governance", "assignment", "experience")
+DRAWING: Final = ("assignment", "experience")  # selections drawn with graph.rng and recomputed when written
 
 
 class Context(Protocol):
@@ -254,6 +286,10 @@ def build_node(
         attrs["observed_at"] = observed_at
     if spec.judgement:
         facts = dict(input_facts or {})
+        if node_type in DRAWING:
+            if facts:
+                raise CtpError(f"{node_type}: the inputs are the selection's definition; input_facts are not given")
+            facts = {"definition": selection.definition(node_type, attrs)}
         ids = sorted(set(input_nodes))
         hashes = {}
         for n in ids:
@@ -437,6 +473,8 @@ def _check_fields(node_type: str, a: Mapping[str, Any], ctx: Context, refuse: Ca
             raise refuse("reason_codes must be a sorted list of distinct strings")
         if not _sorted_unique(a["referenced_inputs"]):
             raise refuse("referenced_inputs must be a sorted list of distinct names")
+    elif node_type in DRAWING:
+        _check_drawing(node_type, a, ctx, refuse)
     elif node_type == "outcome":
         vocab("two_axis", TWO_AXIS)
         undetermined = a.get("undetermined_axis")
@@ -445,6 +483,20 @@ def _check_fields(node_type: str, a: Mapping[str, Any], ctx: Context, refuse: Ca
                 raise refuse(f"two_axis=UNDETERMINED needs undetermined_axis, one of {UNDETERMINED_AXES}")
         elif undetermined is not None:
             raise refuse("undetermined_axis is only for two_axis=UNDETERMINED")
+
+
+def _check_drawing(node_type: str, a: Mapping[str, Any], ctx: Context, refuse: Callable[[str], CtpError]) -> None:
+    try:
+        if node_type == "assignment":
+            doc = f"hextdoc:{a['experiment_spec_hash']}"
+            docattrs = ctx.attrs(doc)
+            if ctx.node_type(doc) != "hext_document" or not docattrs or docattrs.get("hext_kind") != "source":
+                raise refuse(f"experiment_spec_hash must be the state_hash of a stored HEXT source document ({doc!r} is not one)")
+            selection.check_assignment(a, ctx.blob_root())
+        else:
+            selection.check_experience(a, ctx.blob_root())
+    except selection.SelectionError as exc:
+        raise refuse(str(exc)) from exc
 
 
 def _check_blob_ref(a: Mapping[str, Any], ctx: Context, refuse: Callable[[str], CtpError]) -> None:
@@ -483,6 +535,16 @@ def _check_inputs(node_type: str, a: Mapping[str, Any], ctx: Context, refuse: Ca
     referenced = a["referenced_inputs"] if node_type == "governance" else None
     if node_type == "governance" and a["referenced_inputs"] != _input_names(a["input_nodes"], a["input_facts"]):
         raise refuse("referenced_inputs must name exactly the input nodes and facts the record lists")
+    if node_type in DRAWING:
+        if a["input_facts"] != {"definition": selection.definition(node_type, a)}:
+            raise refuse("input_facts must hold exactly the selection's definition")
+        nodes = a["input_nodes"]
+        if node_type == "assignment" and nodes:
+            raise refuse("an assignment has no input node")
+        if node_type == "experience" and (
+            len(nodes) != 1 or ctx.node_type(nodes[0]) != "context_observation" or (ctx.attrs(nodes[0]) or {}).get("episode_id") != a["episode_id"]
+        ):
+            raise refuse("an experience has exactly one input node: the context_observation of its episode")
     if a["input_hash"] != _sha(input_entries(hashes, a["input_facts"], referenced)):
         raise refuse("input_hash is not the hash of the listed inputs")
 
@@ -524,8 +586,18 @@ def check_edge(record: Mapping[str, Any], ctx: Context) -> None:
         if _class(dt) not in ("observation", "evidence"):
             raise refuse("an interpretation interprets an observation or evidence node")
     elif kind == "selects":
-        if st != "governance" or dt != "plan" or (sa or {}).get("plan_id") != (da or {}).get("plan_id"):
-            raise refuse("a governance record selects the plan it decided on (same plan_id)")
+        if st == "assignment":
+            _check_assignment_selects(sa or {}, dt, da or {}, refuse)
+        elif st == "experience":
+            _check_experience_selects(src, sa or {}, dst, dt, da or {}, refuse)
+        elif st != "governance" or dt != "plan" or (sa or {}).get("plan_id") != (da or {}).get("plan_id"):
+            raise refuse("a governance record selects the plan it decided on (same plan_id), an assignment its episode, an experience what it presents")
+    elif kind == "presented_to":
+        if st != "experience" or dt != "step_output" or (da or {}).get("step") != "f2":
+            raise refuse("an experience is presented to the f2 step_output")
+        if (da or {}).get("episode_id") != (sa or {}).get("episode_id"):
+            raise refuse("the step_output belongs to another episode")
+        _check_blob_ref(da or {}, ctx, refuse)  # the context that held the experience must still be there, with those bytes
     elif kind == "considered":
         if st not in SELECTIONS:
             raise refuse(f"a selection ({SELECTIONS}) is the start")
@@ -547,6 +619,26 @@ def check_edge(record: Mapping[str, Any], ctx: Context) -> None:
             raise refuse("an independent compliance judgement audits a verifier's")
         if any((sa or {}).get(f) != (da or {}).get(f) for f in ("episode_id", "level")):
             raise refuse("the two judgements differ in episode or level")
+
+
+def _check_assignment_selects(sa: Mapping[str, Any], dt: str, da: Mapping[str, Any], refuse: Callable[[str], CtpError]) -> None:
+    if dt != "episode":
+        raise refuse("an assignment selects the episode it assigned a condition to")
+    for f in ("experiment_spec_hash", "item_id", "replicate", "condition"):
+        if da.get(f) != sa.get(f):
+            raise refuse(f"the episode's {f} is not the assignment's")
+
+
+def _check_experience_selects(
+    src: str, sa: Mapping[str, Any], dst: str, dt: str, da: Mapping[str, Any], refuse: Callable[[str], CtpError],
+) -> None:
+    if dt not in ("episode", "outcome"):
+        raise refuse("an experience selects an earlier episode or outcome")
+    if dst not in sa.get("selected_ids", []):
+        raise refuse("the experience did not draw this node (selected_ids)")
+    other = dst if dt == "episode" else da.get("episode_id")
+    if other == sa.get("episode_id"):
+        raise refuse("an experience cannot select its own episode or an outcome of it")
 
 
 def _class(node_type: str) -> str | None:

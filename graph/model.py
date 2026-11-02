@@ -46,6 +46,8 @@ NODE_TYPES: Final = (
     "episode", "context_observation", "step_output",
     "applicability", "carry_evidence", "cle_result", "compliance",
     "plan", "governance", "outcome",
+    # CTP episode records, second half (graph/selection.py)
+    "assignment", "experience",
 )
 EDGE_TYPES: Final = (
     "has_causal_log",  # trajectory -> causal_log blob (token range)
@@ -73,6 +75,8 @@ EDGE_TYPES: Final = (
     "considered",  # plan / governance -> a node it considered
     "outcome_of",  # outcome -> episode, or -> plan / governance
     "audits",  # independent compliance -> verifier compliance (same episode and level)
+    # CTP episode records, second half
+    "presented_to",  # experience -> the f2 step_output whose input_context_ref holds the experience
 )
 
 

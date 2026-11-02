@@ -84,13 +84,14 @@ def fresh(store, n):
 
 
 # ---- registration -----------------------------------------------------------------------------------------
-def test_the_ten_types_and_nine_edges_are_registered_and_the_second_half_is_not():
-    assert set(ctp.CTP_NODE_TYPES) == {"episode", "context_observation", "step_output", "applicability", "carry_evidence", "cle_result", "compliance", "plan", "governance", "outcome"}
+def test_the_twelve_types_and_ten_edges_are_registered_and_what_is_still_later_is_not():
+    assert set(ctp.CTP_NODE_TYPES) == {"episode", "context_observation", "step_output", "applicability", "carry_evidence", "cle_result", "compliance", "plan", "governance", "outcome", "assignment", "experience"}
+    assert "presented_to" in ctp.CTP_EDGE_TYPES
     assert set(ctp.CTP_NODE_TYPES) <= set(NODE_TYPES) and set(ctp.CTP_EDGE_TYPES) <= set(EDGE_TYPES)
     assert {"selection", "outcome", "interpretation"} <= set(KINDS)
-    for later in ("experience", "assignment", "experiment_manifest", "human", "trajectory_role"):
+    for later in ("experiment_manifest", "human", "trajectory_role"):
         assert later not in NODE_TYPES
-    for later in ("has_trajectory", "queried_with", "presented_to"):
+    for later in ("has_trajectory", "queried_with"):
         assert later not in EDGE_TYPES
 
 
@@ -388,7 +389,7 @@ def test_outcome_two_axis_vocabulary_undetermined_axis_and_no_reward(store, ep):
 # ---- JCS: floats and out-of-range integers ---------------------------------------------------------------------
 @pytest.mark.parametrize("over", [{"refs": {"score": 0.5}}, {"refs": {"n": 2**60}}, {"refs": {"deep": [{"x": -(2**53)}]}}])
 def test_floats_and_out_of_range_integers_are_refused_in_every_ctp_type(store, ep, over):
-    for n, node_type in enumerate(ctp.CTP_NODE_TYPES):
+    for n, node_type in enumerate(t for t in ctp.CTP_NODE_TYPES if t not in ctp.DRAWING):  # the drawing types: tests/test_ctp_types_b.py
         e2 = fresh(store, n)
         step = write_step(store, e2)
         fields = {
@@ -642,7 +643,7 @@ def test_a_whole_episode_is_stored_and_found_by_the_search(tmp_path):
     two = chain(store, doc, state_hash, "i2", "b1", "CARRIED_VIOLATED", "constraint_broken")
     three = chain(store, doc, state_hash, "i3", "b2", "LOST_VIOLATED", "constraint_dropped")
     kinds = {n["node_type"] for n in store.nodes()}
-    assert set(ctp.CTP_NODE_TYPES) <= kinds and all(d70_class(n) for n in store.nodes() if n["node_type"] in ctp.CTP_NODE_TYPES)
+    assert set(ctp.CTP_NODE_TYPES) - set(ctp.DRAWING) <= kinds and all(d70_class(n) for n in store.nodes() if n["node_type"] in ctp.CTP_NODE_TYPES)
     # every stage has its blob, and the spec is the projected HEXT source
     assert all(blob_path(tmp_path, n["attrs"]["input_context_sha256"]).exists() for n in store.nodes() if n["node_type"] == "step_output")
     assert store.attrs(doc)["hext_kind"] == "source" and store.attrs(doc)["state_hash"] == state_hash

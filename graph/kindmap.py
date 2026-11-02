@@ -54,6 +54,8 @@ KIND_MAP: Final[Mapping[str, KindRule]] = {
     "plan": KindRule("selection", "selection", "CTP v0.3 s3"),
     "governance": KindRule("selection", "selection", "CTP v0.3 s3"),
     "outcome": KindRule("outcome", "outcome", "CTP v0.3 s3"),
+    "assignment": KindRule("selection", "selection", "CTP v0.3 s3"),
+    "experience": KindRule("selection", "selection", "CTP v0.3 s3"),
     # not in the v0.3.3 table; decided by Tomo (see DECISION_A)
     "causal_log": KindRule("observation", "observation", DECISION_A),
     "source_text": KindRule("observation", "observation", DECISION_A),

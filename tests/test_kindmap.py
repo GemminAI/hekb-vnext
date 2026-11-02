@@ -46,6 +46,8 @@ EXPECTED = {
     "plan": ("selection", "selection"),
     "governance": ("selection", "selection"),
     "outcome": ("outcome", "outcome"),
+    "assignment": ("selection", "selection"),
+    "experience": ("selection", "selection"),
     "causal_log": ("observation", "observation"),
     "source_text": ("observation", "observation"),
     "policy_set": ("observation", "observation"),
@@ -54,7 +56,7 @@ EXPECTED = {
 
 
 SHAPED = {"axis_verification", "episode", "context_observation", "step_output", "applicability", "carry_evidence",
-          "cle_result", "compliance", "plan", "governance", "outcome"}
+          "cle_result", "compliance", "plan", "governance", "outcome", "assignment", "experience"}
 
 
 def test_the_table_is_the_v033_table_and_covers_every_node_type():
