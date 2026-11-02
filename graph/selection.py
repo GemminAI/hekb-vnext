@@ -15,7 +15,11 @@ must equal the recomputed one:
   is always true); ``conditional_selection_probabilities[i]`` = 1/(n-i), ``slate_probability.set`` = 1/C(n,k) and
   ``.ordered`` = (n-k)!/n!. ``arm_id`` = ``"arm:" + sha256(JCS({selected_ids, presentation_mode,
   presentation_format}))``: the episode, the policy, the candidate set and the condition are not in it.
-* a probability is an irreducible fraction ``{num, den}``; ``probability_source`` is ``selector``, or
+* a probability is an irreducible fraction ``{num, den}`` whose two members are decimal strings (no sign, no leading
+  zero, ``den`` is not "0"): an integer member is refused, so a denominator such as n!/(n-k)! never meets the JCS
+  limit of 2**53 - 1. Values are compared and recomputed as Python integers.
+* the policy fingerprint is ``sha256(JCS({...}))`` over the algorithm, the settings the draw reads and the policy's
+  free ``..._policy_params`` object, recomputed at write time; ``probability_source`` is ``selector``, or
   ``single_candidate`` when the blob really holds one candidate.
 """
 
@@ -45,14 +49,16 @@ PREFILL_TRAJECTORY_NOT_AVAILABLE: Final = "PREFILL_TRAJECTORY_NOT_AVAILABLE"
 
 ASSIGNMENT_DEFINITION: Final = (
     "assignment_candidate_set_hash", "assignment_algorithm", "assignment_stratum", "assignment_rng",
-    "assignment_policy_id", "assignment_policy_version",
+    "assignment_policy_id", "assignment_policy_version", "assignment_policy_params", "assignment_policy_fingerprint",
 )
 EXPERIENCE_DEFINITION: Final = (
     "candidate_set_hash", "selection_algorithm", "k", "replacement", "order_considered", "ordering_rule", "rng",
-    "selection_policy_id", "selection_policy_version", "selection_policy_fingerprint", "retrieval_space",
+    "selection_policy_id", "selection_policy_version", "selection_policy_params", "selection_policy_fingerprint",
+    "retrieval_space",
 )
 
 _BLOB_REF = re.compile(r"^blob:([0-9a-f]{64})$")
+_DECIMAL = re.compile(r"^(0|[1-9][0-9]*)$")
 
 
 class SelectionError(GraphError):
@@ -101,20 +107,37 @@ def read_candidates(root: Path | None, ref: Any, set_hash: Any, what: str) -> li
 
 
 # ---- fractions --------------------------------------------------------------------------------------------
-def fraction(value: Fraction) -> dict[str, int]:
-    return {"num": value.numerator, "den": value.denominator}
+def fraction(value: Fraction) -> dict[str, str]:
+    return {"num": str(value.numerator), "den": str(value.denominator)}
 
 
 def check_fraction(value: Any, what: str) -> None:
-    if (
-        not isinstance(value, dict) or set(value) != {"num", "den"}
-        or not all(isinstance(value[k], int) and not isinstance(value[k], bool) for k in value)
-    ):
-        raise SelectionError(f"{what} must be a fraction {{num, den}} of integers")
-    if value["den"] < 1 or value["num"] < 0:
-        raise SelectionError(f"{what} must have num >= 0 and den >= 1")
-    if math.gcd(value["num"], value["den"]) != 1:
+    if not isinstance(value, dict) or set(value) != {"num", "den"}:
+        raise SelectionError(f"{what} must be a fraction {{num, den}}")
+    if not all(isinstance(v, str) and _DECIMAL.match(v) for v in value.values()):
+        raise SelectionError(f"{what}: num and den must be decimal strings (digits only, no sign, no leading zero)")
+    num, den = int(value["num"]), int(value["den"])
+    if den == 0:
+        raise SelectionError(f"{what}: den must not be 0")
+    if math.gcd(num, den) != 1:
         raise SelectionError(f"{what} is not an irreducible fraction")
+
+
+def policy_fingerprint(material: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_bytes(material)).hexdigest()
+
+
+def selection_fingerprint(a: Mapping[str, Any]) -> str:
+    return policy_fingerprint({f: a.get(f) for f in ("selection_algorithm", "k", "replacement", "order_considered", "ordering_rule", "selection_policy_params")})
+
+
+def assignment_fingerprint(a: Mapping[str, Any]) -> str:
+    return policy_fingerprint({f: a.get(f) for f in ("assignment_algorithm", "assignment_stratum", "assignment_policy_params")})
+
+
+def _check_params(a: Mapping[str, Any], field: str) -> None:
+    if not isinstance(a[field], dict):
+        raise SelectionError(f"{field} must be an object")
 
 
 def _check_rng(value: Any, what: str) -> str:
@@ -144,19 +167,22 @@ def _strings(a: Mapping[str, Any], *fields: str) -> None:
 # ---- assignment -----------------------------------------------------------------------------------------------
 def assignment_fields(
     experiment_spec_hash: str, item_id: str, replicate: int, candidates: Sequence[str], candidates_sha: str, *,
-    seed: str, stratum: str, policy_id: str, policy_version: str, probability_source: str = "selector",
+    seed: str, stratum: str, policy_id: str, policy_version: str, policy_params: Mapping[str, Any] | None = None,
+    probability_source: str = "selector",
 ) -> dict[str, Any]:
     """The fields of an assignment, drawn from ``candidates`` (whose blob ``candidates_blob`` is stored under ``candidates_sha``)."""
     ordered = byte_sorted(candidates)
-    return {
+    fields = {
         "experiment_spec_hash": experiment_spec_hash, "item_id": item_id, "replicate": replicate,
         "assignment_candidates_ref": f"blob:{candidates_sha}", "assignment_candidate_set_hash": candidates_sha,
         "assignment_algorithm": dict(ASSIGNMENT_ALGORITHM), "assignment_stratum": stratum,
         "assignment_rng": {"algorithm": rng.ALGORITHM, "seed": seed},
         "assignment_policy_id": policy_id, "assignment_policy_version": policy_version,
+        "assignment_policy_params": dict(policy_params or {}),
         "condition": rng.choose_one(ordered, seed), "assignment_probability": fraction(Fraction(1, len(ordered))),
         "probability_source": probability_source,
     }
+    return {**fields, "assignment_policy_fingerprint": assignment_fingerprint(fields)}
 
 
 def check_assignment(a: Mapping[str, Any], root: Path | None) -> None:
@@ -167,6 +193,9 @@ def check_assignment(a: Mapping[str, Any], root: Path | None) -> None:
         raise SelectionError(f"assignment_algorithm must be {ASSIGNMENT_ALGORITHM}")
     seed = _check_rng(a["assignment_rng"], "assignment_rng")
     check_fraction(a["assignment_probability"], "assignment_probability")
+    _check_params(a, "assignment_policy_params")
+    if a["assignment_policy_fingerprint"] != assignment_fingerprint(a):
+        raise SelectionError("recomputation: assignment_policy_fingerprint is not sha256(JCS({assignment_algorithm, assignment_stratum, assignment_policy_params}))")
     candidates = read_candidates(root, a["assignment_candidates_ref"], a["assignment_candidate_set_hash"], "assignment")
     _check_source(a, len(candidates))
     expected = rng.choose_one(candidates, seed)
@@ -182,7 +211,7 @@ def arm_id(selected_ids: Sequence[str], presentation_mode: str, presentation_for
     return "arm:" + hashlib.sha256(canonical_bytes(material)).hexdigest()
 
 
-def expected_probabilities(n: int, k: int) -> tuple[list[dict[str, int]], dict[str, dict[str, int]]]:
+def expected_probabilities(n: int, k: int) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     steps = [fraction(Fraction(1, n - i)) for i in range(k)]
     ordered = Fraction(math.factorial(n - k), math.factorial(n))
     return steps, {"set": fraction(Fraction(1, math.comb(n, k))), "ordered": fraction(ordered)}
@@ -190,7 +219,7 @@ def expected_probabilities(n: int, k: int) -> tuple[list[dict[str, int]], dict[s
 
 def experience_fields(
     episode_id: str, candidates: Sequence[str], candidates_sha: str, *, k: int, seed: str,
-    policy_id: str, policy_version: str, policy_fingerprint: str,
+    policy_id: str, policy_version: str, policy_params: Mapping[str, Any] | None = None,
     presentation_mode: str, presentation_format: Mapping[str, str],
     retrieval_space: str = "R-text", probability_source: str = "selector",
 ) -> dict[str, Any]:
@@ -198,16 +227,18 @@ def experience_fields(
     ordered = byte_sorted(candidates)
     selected = rng.choose_ordered(ordered, k, seed)
     steps, slate = expected_probabilities(len(ordered), k)
-    return {
+    fields = {
         "episode_id": episode_id, "candidates_ref": f"blob:{candidates_sha}", "candidate_set_hash": candidates_sha,
         "selection_algorithm": dict(SELECTION_ALGORITHM), "k": k, "replacement": False, "order_considered": True,
         "ordering_rule": ORDERING_RULE, "rng": {"algorithm": rng.ALGORITHM, "seed": seed},
-        "selection_policy_id": policy_id, "selection_policy_version": policy_version, "selection_policy_fingerprint": policy_fingerprint,
+        "selection_policy_id": policy_id, "selection_policy_version": policy_version,
+        "selection_policy_params": dict(policy_params or {}),
         "selected_ids": selected, "conditional_selection_probabilities": steps, "slate_probability": slate,
         "arm_id": arm_id(selected, presentation_mode, presentation_format),
         "presentation_mode": presentation_mode, "presentation_format": dict(presentation_format),
         "retrieval_space": retrieval_space, "probability_source": probability_source,
     }
+    return {**fields, "selection_policy_fingerprint": selection_fingerprint(fields)}
 
 
 def check_experience(a: Mapping[str, Any], root: Path | None) -> None:
@@ -215,7 +246,8 @@ def check_experience(a: Mapping[str, Any], root: Path | None) -> None:
         raise SelectionError(f"retrieval_space must be one of {RETRIEVAL_SPACES}")
     if a["retrieval_space"] == "R-traj":
         raise SelectionError(f"{PREFILL_TRAJECTORY_NOT_AVAILABLE}: R-traj needs the pre-decision read trajectory (Stage F), which does not exist yet")
-    _strings(a, "selection_policy_id", "selection_policy_version", "selection_policy_fingerprint")
+    _strings(a, "selection_policy_id", "selection_policy_version")
+    _check_params(a, "selection_policy_params")
     if a["selection_algorithm"] != SELECTION_ALGORITHM:
         raise SelectionError(f"selection_algorithm must be {SELECTION_ALGORITHM}")
     if a["replacement"] is not False:
@@ -225,6 +257,8 @@ def check_experience(a: Mapping[str, Any], root: Path | None) -> None:
     if a["ordering_rule"] != ORDERING_RULE:
         raise SelectionError(f"ordering_rule must be {ORDERING_RULE!r}")
     seed = _check_rng(a["rng"], "rng")
+    if a["selection_policy_fingerprint"] != selection_fingerprint(a):
+        raise SelectionError("recomputation: selection_policy_fingerprint is not sha256(JCS({selection_algorithm, k, replacement, order_considered, ordering_rule, selection_policy_params}))")
     if a["presentation_mode"] not in PRESENTATION_MODES:
         raise SelectionError(f"presentation_mode must be one of {PRESENTATION_MODES}")
     fmt = a["presentation_format"]

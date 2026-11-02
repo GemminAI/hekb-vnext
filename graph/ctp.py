@@ -184,7 +184,7 @@ SPECS: Final[Mapping[str, Spec]] = {
         (
             "experiment_spec_hash", "item_id", "replicate", "assignment_candidates_ref", "assignment_candidate_set_hash",
             "assignment_algorithm", "assignment_stratum", "assignment_rng", "assignment_policy_id", "assignment_policy_version",
-            "condition", "assignment_probability", "probability_source",
+            "assignment_policy_params", "assignment_policy_fingerprint", "condition", "assignment_probability", "probability_source",
         ),
         (),
         ("experiment_spec_hash", "item_id", "replicate"),
@@ -194,8 +194,8 @@ SPECS: Final[Mapping[str, Spec]] = {
         "selection",
         (
             "episode_id", "candidates_ref", "candidate_set_hash", "selection_algorithm", "k", "replacement", "order_considered",
-            "ordering_rule", "rng", "selection_policy_id", "selection_policy_version", "selection_policy_fingerprint",
-            "selected_ids", "conditional_selection_probabilities", "slate_probability", "arm_id", "presentation_mode",
+            "ordering_rule", "rng", "selection_policy_id", "selection_policy_version", "selection_policy_params",
+            "selection_policy_fingerprint", "selected_ids", "conditional_selection_probabilities", "slate_probability", "arm_id", "presentation_mode",
             "presentation_format", "retrieval_space", "probability_source",
         ),
         (),

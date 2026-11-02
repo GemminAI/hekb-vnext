@@ -62,9 +62,12 @@ def write_step(store, ep, step="f2"):
 CONDITIONS = ["E0", "E1", "E2", "E3", "E4"]
 
 
-def assignment_fields(store, candidates=CONDITIONS, seed="a-seed", **over):
-    fields = selection.assignment_fields(SPEC_HASH, "i1", 0, candidates, blob(store, candidates), seed=seed, stratum="b1", policy_id="uniform", policy_version="1")
-    return {**fields, **over}
+def assignment_fields(store, candidates=CONDITIONS, seed="a-seed", policy_params=None, **over):
+    fields = selection.assignment_fields(SPEC_HASH, "i1", 0, candidates, blob(store, candidates), seed=seed, stratum="b1", policy_id="uniform", policy_version="1", policy_params=policy_params)
+    fields.update(over)
+    if "assignment_policy_fingerprint" not in over:  # a changed algorithm, stratum or params is meant to be a consistent record, unless the test says otherwise
+        fields["assignment_policy_fingerprint"] = selection.assignment_fingerprint(fields)
+    return fields
 
 
 def write_assignment(store, **over):
@@ -86,7 +89,7 @@ def ep(store):
 
 def experience_fields(store, ep, candidates, k=3, seed="e-seed", **over):
     fields = selection.experience_fields(
-        ep, candidates, blob(store, candidates), k=k, seed=seed, policy_id="uniform-k", policy_version="1", policy_fingerprint="f" * 64,
+        ep, candidates, blob(store, candidates), k=k, seed=seed, policy_id="uniform-k", policy_version="1",
         presentation_mode="contrast", presentation_format=FORMAT,
     )
     return {**fields, **over}
@@ -213,14 +216,14 @@ def test_an_assignment_draws_one_condition_with_probability_one_over_m(store):
     node = write_assignment(store)
     a = attrs_of(store, node)
     assert a["condition"] == CONDITIONS[ref_word("a-seed", 0) % 5] == selection.byte_sorted(CONDITIONS)[ref_word("a-seed", 0) % 5]
-    assert a["assignment_probability"] == {"num": 1, "den": 5} and a["probability_source"] == "selector"
+    assert a["assignment_probability"] == {"num": "1", "den": "5"} and a["probability_source"] == "selector"
     assert a["assignment_algorithm"] == {"name": "uniform_within_stratum", "version": "1"} and a["assignment_rng"] == {"algorithm": "sha256_rejection_v1", "seed": "a-seed"}
     assert write_assignment(store) == node and node.startswith("assignment:")
 
 
 def test_the_candidates_of_an_assignment_are_read_from_the_blob_in_byte_order(store):
     node = write_assignment(store, candidates=["E4", "E2", "E0"], seed="s1")  # given unsorted: the blob is sorted
-    assert attrs_of(store, node)["assignment_probability"] == {"num": 1, "den": 3}
+    assert attrs_of(store, node)["assignment_probability"] == {"num": "1", "den": "3"}
     assert json.loads((store.blob_dir / "blobs" / attrs_of(store, node)["assignment_candidate_set_hash"][:2] / attrs_of(store, node)["assignment_candidate_set_hash"][2:4] / attrs_of(store, node)["assignment_candidate_set_hash"]).read_bytes()) == ["E0", "E2", "E4"]
 
 
@@ -232,12 +235,19 @@ def other_condition(seed="a-seed"):
     "bad, match",
     [
         ({"condition": "WRONG"}, "recomputation: the condition"),
-        ({"assignment_probability": {"num": 1, "den": 4}}, "recomputation: assignment_probability"),
-        ({"assignment_probability": {"num": 2, "den": 10}}, "irreducible"),
-        ({"assignment_probability": {"num": 0, "den": 1}}, "recomputation: assignment_probability"),
+        ({"assignment_probability": {"num": "1", "den": "4"}}, "recomputation: assignment_probability"),
+        ({"assignment_probability": {"num": "2", "den": "10"}}, "irreducible"),
+        ({"assignment_probability": {"num": "0", "den": "1"}}, "recomputation: assignment_probability"),
         ({"assignment_probability": 0.2}, "floating-point"),
         ({"assignment_probability": {"num": 1.0, "den": 5}}, "floating-point"),
         ({"assignment_probability": "1/5"}, "fraction"),
+        ({"assignment_probability": {"num": 1, "den": 5}}, "decimal strings"),
+        ({"assignment_probability": {"num": "01", "den": "5"}}, "decimal strings"),
+        ({"assignment_probability": {"num": "1", "den": "05"}}, "decimal strings"),
+        ({"assignment_probability": {"num": "-1", "den": "5"}}, "decimal strings"),
+        ({"assignment_probability": {"num": "1", "den": "0"}}, "den must not be 0"),
+        ({"assignment_policy_fingerprint": "f" * 64}, "recomputation: assignment_policy_fingerprint"),
+        ({"assignment_policy_params": 3}, "assignment_policy_params must be an object"),
         ({"assignment_algorithm": {"name": "uniform_within_stratum", "version": "2"}}, "assignment_algorithm must be"),
         ({"assignment_algorithm": {"name": "something_else", "version": "1"}}, "assignment_algorithm must be"),
         ({"assignment_rng": {"algorithm": "random.Random", "seed": "a-seed"}}, "sha256_rejection_v1"),
@@ -286,7 +296,7 @@ def test_a_missing_or_unsorted_or_duplicated_candidate_blob_is_refused(store, tm
 def test_single_candidate_is_allowed_only_when_the_blob_holds_one_candidate(store):
     node = write_assignment(store, candidates=["E0"], probability_source="single_candidate")
     a = attrs_of(store, node)
-    assert a["condition"] == "E0" and a["assignment_probability"] == {"num": 1, "den": 1}
+    assert a["condition"] == "E0" and a["assignment_probability"] == {"num": "1", "den": "1"}
     assert write_assignment(store, candidates=["E0"], seed="other")  # selector is fine for one candidate too
     with pytest.raises(CtpError, match="only for a candidate set of one"):
         write_assignment(store, candidates=["E0", "E1"], probability_source="single_candidate")
@@ -341,8 +351,8 @@ def test_an_experience_draws_k_in_order_without_replacement_and_records_the_prob
     assert a["selected_ids"] == _reference_order(cands, "e-seed")[:3] == rng.choose_ordered(cands, 3, "e-seed")
     assert len(set(a["selected_ids"])) == 3 and set(a["selected_ids"]) <= set(cands) and "order" not in a
     n, k = 5, 3
-    assert a["conditional_selection_probabilities"] == [{"num": 1, "den": 5}, {"num": 1, "den": 4}, {"num": 1, "den": 3}]
-    assert a["slate_probability"] == {"set": {"num": 1, "den": math.comb(n, k)}, "ordered": {"num": 1, "den": 60}}
+    assert a["conditional_selection_probabilities"] == [{"num": "1", "den": "5"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]
+    assert a["slate_probability"] == {"set": {"num": "1", "den": str(math.comb(n, k))}, "ordered": {"num": "1", "den": "60"}}
     assert a["selection_algorithm"] == {"name": "uniform_ordered_k_subset_without_replacement", "version": "1"}
     assert (a["replacement"], a["order_considered"], a["ordering_rule"], a["retrieval_space"], a["probability_source"]) == (False, True, "node_id_bytewise_ascending", "R-text", "selector")
     assert a["arm_id"].startswith("arm:") and node.startswith("experience:") and write_experience(store, ep, past["candidates"]) == node
@@ -352,16 +362,21 @@ def test_the_ordered_probability_is_the_set_probability_over_k_factorial(store, 
     for k in (1, 2, 3, 4, 5):
         a = attrs_of(store, write_experience(store, ep, past["candidates"], k=k, seed=f"k{k}"))
         n = 5
-        assert a["slate_probability"]["set"]["den"] == math.comb(n, k)
-        assert a["slate_probability"]["ordered"]["den"] == math.factorial(n) // math.factorial(n - k)
-        assert math.gcd(a["slate_probability"]["ordered"]["num"], a["slate_probability"]["ordered"]["den"]) == 1
-        assert a["slate_probability"]["ordered"]["den"] == a["slate_probability"]["set"]["den"] * math.factorial(k)
-        assert [p["den"] for p in a["conditional_selection_probabilities"]] == [n - i for i in range(k)]
+        assert a["slate_probability"]["set"]["den"] == str(math.comb(n, k))
+        assert a["slate_probability"]["ordered"]["den"] == str(math.factorial(n) // math.factorial(n - k))
+        assert math.gcd(int(a["slate_probability"]["ordered"]["num"]), int(a["slate_probability"]["ordered"]["den"])) == 1
+        assert int(a["slate_probability"]["ordered"]["den"]) == int(a["slate_probability"]["set"]["den"]) * math.factorial(k)
+        assert [p["den"] for p in a["conditional_selection_probabilities"]] == [str(n - i) for i in range(k)]
 
 
-def tampered(store, ep, past, **over):
-    """The fields of a valid draw, then ``over`` written on top of them (so k, rng and the rest can be made wrong)."""
-    fields = {**experience_fields(store, ep, past["candidates"], k=min(3, len(past["candidates"]))), **over}
+def tampered(store, ep, past, seed="e-seed", **over):
+    """The fields of a valid draw, then ``over`` written on top of them (so k, rng and the rest can be made wrong).
+
+    The policy fingerprint follows the overridden settings unless the test gives one: it is checked on its own below.
+    """
+    fields = {**experience_fields(store, ep, past["candidates"], k=min(3, len(past["candidates"])), seed=seed), **over}
+    if "selection_policy_fingerprint" not in over:
+        fields["selection_policy_fingerprint"] = selection.selection_fingerprint(fields)
     return store.write_ctp_node("experience", fields, producer=PRODUCER, input_nodes=(write_context(store, ep),))
 
 
@@ -372,15 +387,15 @@ def tampered(store, ep, past, **over):
         (lambda a: {"selected_ids": sorted(a["selected_ids"])}, "recomputation: the 3 drawn"),
         (lambda a: {"selected_ids": a["selected_ids"][:2]}, "recomputation: the 3 drawn"),
         (lambda a: {"selected_ids": ["nope", *a["selected_ids"][1:]]}, "recomputation: the 3 drawn"),
-        (lambda a: {"conditional_selection_probabilities": [{"num": 1, "den": 5}, {"num": 1, "den": 4}, {"num": 1, "den": 2}]}, "recomputation: conditional"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "1", "den": "5"}, {"num": "1", "den": "4"}, {"num": "1", "den": "2"}]}, "recomputation: conditional"),
         (lambda a: {"conditional_selection_probabilities": a["conditional_selection_probabilities"][:2]}, "recomputation: conditional"),
-        (lambda a: {"conditional_selection_probabilities": [{"num": 2, "den": 10}, {"num": 1, "den": 4}, {"num": 1, "den": 3}]}, "irreducible"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "2", "den": "10"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "irreducible"),
         (lambda a: {"conditional_selection_probabilities": [0.2, 0.25, 0.3333]}, "floating-point"),
-        (lambda a: {"slate_probability": {"set": {"num": 1, "den": 10}, "ordered": {"num": 1, "den": 59}}}, "recomputation: slate_probability"),
-        (lambda a: {"slate_probability": {"set": {"num": 1, "den": 60}, "ordered": {"num": 1, "den": 60}}}, "recomputation: slate_probability"),
-        (lambda a: {"slate_probability": {"set": {"num": 2, "den": 20}, "ordered": {"num": 1, "den": 60}}}, "irreducible"),
+        (lambda a: {"slate_probability": {"set": {"num": "1", "den": "10"}, "ordered": {"num": "1", "den": "59"}}}, "recomputation: slate_probability"),
+        (lambda a: {"slate_probability": {"set": {"num": "1", "den": "60"}, "ordered": {"num": "1", "den": "60"}}}, "recomputation: slate_probability"),
+        (lambda a: {"slate_probability": {"set": {"num": "2", "den": "20"}, "ordered": {"num": "1", "den": "60"}}}, "irreducible"),
         (lambda a: {"slate_probability": {"set": 0.1, "ordered": 0.0166}}, "floating-point"),
-        (lambda a: {"slate_probability": {"set": {"num": 1, "den": 10}}}, "slate_probability must be"),
+        (lambda a: {"slate_probability": {"set": {"num": "1", "den": "10"}}}, "slate_probability must be"),
         (lambda a: {"arm_id": "arm:" + "0" * 64}, "arm_id"),
         (lambda a: {"presentation_mode": "violation_only"}, "arm_id"),
         (lambda a: {"presentation_mode": "everything"}, "presentation_mode"),
@@ -403,6 +418,19 @@ def tampered(store, ep, past, **over):
         (lambda a: {"probability_source": "single_candidate"}, "only for a candidate set of one"),
         (lambda a: {"retrieval_space": "R-vector"}, "retrieval_space"),
         (lambda a: {"selection_policy_fingerprint": ""}, "selection_policy_fingerprint"),
+        (lambda a: {"selection_policy_fingerprint": "f" * 64}, "recomputation: selection_policy_fingerprint"),
+        (lambda a: {"selection_policy_params": {"pool": "recent"}, "selection_policy_fingerprint": a["selection_policy_fingerprint"]}, "recomputation: selection_policy_fingerprint"),  # the params changed, the fingerprint did not
+        (lambda a: {"selection_policy_params": [1]}, "selection_policy_params must be an object"),
+        (lambda a: {"selection_policy_params": {"x": 0.5}}, "floating-point"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": 1, "den": 5}, {"num": 1, "den": 4}, {"num": 1, "den": 3}]}, "decimal strings"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "01", "den": "5"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "decimal strings"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "+1", "den": "5"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "decimal strings"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "-1", "den": "5"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "decimal strings"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "1", "den": "0"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "den must not be 0"),
+        (lambda a: {"conditional_selection_probabilities": [{"num": "2", "den": "10"}, {"num": "1", "den": "4"}, {"num": "1", "den": "3"}]}, "irreducible"),
+        (lambda a: {"slate_probability": {"set": {"num": 1, "den": 10}, "ordered": {"num": 1, "den": 60}}}, "decimal strings"),
+        (lambda a: {"slate_probability": {"set": {"num": "1", "den": "10"}, "ordered": {"num": "01", "den": "60"}}}, "decimal strings"),
+        (lambda a: {"slate_probability": {"set": {"num": "3", "den": "30"}, "ordered": {"num": "1", "den": "60"}}}, "irreducible"),
         (lambda a: {"candidates_ref": "blob:" + "9" * 64, "candidate_set_hash": "9" * 64}, "is not in the blob location"),
     ],
 )
@@ -453,12 +481,73 @@ def test_a_single_candidate_experience(store, ep, past):
     one = [past["episodes"][0]]
     node = write_experience(store, ep, one, k=1, probability_source="single_candidate")
     a = attrs_of(store, node)
-    assert a["selected_ids"] == one and a["slate_probability"] == {"set": {"num": 1, "den": 1}, "ordered": {"num": 1, "den": 1}}
-    assert a["conditional_selection_probabilities"] == [{"num": 1, "den": 1}]
+    assert a["selected_ids"] == one and a["slate_probability"] == {"set": {"num": "1", "den": "1"}, "ordered": {"num": "1", "den": "1"}}
+    assert a["conditional_selection_probabilities"] == [{"num": "1", "den": "1"}]
     with pytest.raises(CtpError, match="only for a candidate set of one"):
         write_experience(store, ep, past["candidates"], probability_source="single_candidate")
     with pytest.raises(CtpError, match="k must be"):
         tampered(store, ep, {"candidates": one}, k=2)
+
+
+# ---- policy params and fingerprints; large n and k -------------------------------------------------------------------
+def test_params_that_differ_alone_make_another_fingerprint_another_input_hash_and_another_node_id(store, ep, past):
+    base = write_experience(store, ep, past["candidates"])
+    ctx = write_context(store, ep)
+    ids = {}
+    for name, params in (("none", {}), ("a", {"recency": "7"}), ("b", {"recency": "8"}), ("nested", {"w": {"x": ["1", "2"]}})):
+        fields = selection.experience_fields(ep, past["candidates"], blob(store, past["candidates"]), k=3, seed="e-seed", policy_id="uniform-k", policy_version="1", policy_params=params, presentation_mode="contrast", presentation_format=FORMAT)
+        ids[name] = store.write_ctp_node("experience", fields, producer=PRODUCER, input_nodes=(ctx,))
+        got = attrs_of(store, ids[name])
+        assert got["selection_policy_params"] == params
+        assert got["selection_policy_fingerprint"] == hashlib.sha256(canonical_bytes({f: got[f] for f in ("selection_algorithm", "k", "replacement", "order_considered", "ordering_rule", "selection_policy_params")})).hexdigest()
+    assert ids["none"] == base and len(set(ids.values())) == 4
+    hashes = {attrs_of(store, i)["input_hash"] for i in ids.values()}
+    fps = {attrs_of(store, i)["selection_policy_fingerprint"] for i in ids.values()}
+    assert len(hashes) == 4 and len(fps) == 4
+    assert len({tuple(attrs_of(store, i)["selected_ids"]) for i in ids.values()}) == 1  # the draw is the same: only the params differ
+
+
+def test_assignment_params_and_fingerprint(store):
+    ids = {}
+    for name, params in (("none", {}), ("a", {"w": "1"}), ("b", {"w": "2"})):
+        fields = selection.assignment_fields(SPEC_HASH, "i1", 0, CONDITIONS, blob(store, CONDITIONS), seed="a-seed", stratum="b1", policy_id="uniform", policy_version="1", policy_params=params)
+        ids[name] = store.write_ctp_node("assignment", fields, producer=PRODUCER)
+        got = attrs_of(store, ids[name])
+        assert got["assignment_policy_fingerprint"] == hashlib.sha256(canonical_bytes({f: got[f] for f in ("assignment_algorithm", "assignment_stratum", "assignment_policy_params")})).hexdigest()
+    assert ids["none"] == write_assignment(store) and len(set(ids.values())) == 3
+    assert len({attrs_of(store, i)["assignment_policy_fingerprint"] for i in ids.values()}) == 3
+    assert len({attrs_of(store, i)["condition"] for i in ids.values()}) == 1  # params and stratum never enter the draw
+    stratum = write_assignment(store, assignment_stratum="b2")  # a changed stratum changes the fingerprint too
+    assert attrs_of(store, stratum)["assignment_policy_fingerprint"] != attrs_of(store, ids["none"])["assignment_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("n, k", [(100, 48), (200, 12), (1000, 7)])
+def test_a_large_selection_is_stored_and_matches_its_recomputation(store, ep, n, k):
+    cands = [f"episode:{i:04d}" for i in range(n)]
+    node = write_experience(store, ep, cands, k=k, seed=f"big-{n}-{k}")
+    a = attrs_of(store, node)
+    assert a["selected_ids"] == _reference_order(selection.byte_sorted(cands), f"big-{n}-{k}")[:k] and len(set(a["selected_ids"])) == k
+    assert a["slate_probability"]["set"] == {"num": "1", "den": str(math.comb(n, k))}
+    assert a["slate_probability"]["ordered"] == {"num": "1", "den": str(math.factorial(n) // math.factorial(n - k))}
+    assert int(a["slate_probability"]["ordered"]["den"]) > 2**53  # a bare integer would not have been storable
+    assert [p["den"] for p in a["conditional_selection_probabilities"]] == [str(n - i) for i in range(k)]
+    assert write_experience(store, ep, cands, k=k, seed=f"big-{n}-{k}") == node  # idempotent
+    wrong = {**experience_fields(store, ep, cands, k=k, seed=f"big-{n}-{k}"), "slate_probability": {"set": {"num": "1", "den": str(math.comb(n, k) + 1)}, "ordered": a["slate_probability"]["ordered"]}}
+    with pytest.raises(CtpError, match="recomputation: slate_probability"):
+        store.write_ctp_node("experience", wrong, producer=PRODUCER, input_nodes=(write_context(store, ep),))
+
+
+def test_params_changed_without_the_fingerprint_are_refused_for_an_assignment(store):
+    good = assignment_fields(store)
+    with pytest.raises(CtpError, match="recomputation: assignment_policy_fingerprint"):
+        store.write_ctp_node("assignment", {**good, "assignment_policy_params": {"pool": "x"}}, producer=PRODUCER)
+    with pytest.raises(CtpError, match="recomputation: assignment_policy_fingerprint"):
+        store.write_ctp_node("assignment", {**good, "assignment_stratum": "b9"}, producer=PRODUCER)  # the stratum is in the material too
+
+
+def test_an_integer_fraction_is_not_a_probability_even_when_it_is_small(store):
+    with pytest.raises(CtpError, match="decimal strings"):
+        write_assignment(store, assignment_probability={"num": 1, "den": 5})
 
 
 def test_the_arm_is_the_presented_content_and_the_node_is_the_selection_event(store, past):
@@ -470,7 +559,7 @@ def test_the_arm_is_the_presented_content_and_the_node_is_the_selection_event(st
     eps = [write_episode(store, item_id=f"arm{i}") for i in range(2)]
     nodes = []
     for e, seed, policy in zip(eps, seeds[:2], ("policy-a", "policy-b"), strict=True):
-        fields = selection.experience_fields(e, cands, blob(store, cands), k=k, seed=seed, policy_id=policy, policy_version="1", policy_fingerprint=policy * 8,
+        fields = selection.experience_fields(e, cands, blob(store, cands), k=k, seed=seed, policy_id=policy, policy_version="1",
                                              presentation_mode="contrast", presentation_format=FORMAT)
         nodes.append(store.write_ctp_node("experience", fields, producer=PRODUCER, input_nodes=(write_context(store, e),)))
     a, b = (attrs_of(store, n) for n in nodes)
@@ -506,13 +595,15 @@ def test_the_input_hash_covers_the_whole_definition_and_the_context_record(store
     assert set(attrs_of(store, base)["input_facts"]["definition"]) == set(selection.EXPERIENCE_DEFINITION)
     variants = {
         "policy version": dict(selection_policy_version="2"),
-        "fingerprint": dict(selection_policy_fingerprint="e" * 64),
         "policy id": dict(selection_policy_id="uniform-other"),
         "retrieval space": dict(retrieval_space="R-struct"),
     }
     ids = {name: write_experience(store, ep, past["candidates"], **over) for name, over in variants.items()}
-    assert len({base, *ids.values()}) == 5
+    assert len({base, *ids.values()}) == 4
     ids["k"] = write_experience(store, ep, past["candidates"], k=2)
+    with_params = selection.experience_fields(ep, past["candidates"], blob(store, past["candidates"]), k=3, seed="e-seed", policy_id="uniform-k", policy_version="1",
+                                              policy_params={"temperature": "1"}, presentation_mode="contrast", presentation_format=FORMAT)
+    ids["params"] = store.write_ctp_node("experience", with_params, producer=PRODUCER, input_nodes=(write_context(store, ep),))
     ids["candidates"] = write_experience(store, ep, past["candidates"][:4], k=3)
     ids["seed"] = write_experience(store, ep, past["candidates"], seed="another")
     assert len({base, *ids.values()}) == 8
@@ -628,7 +719,7 @@ e = ep("i1", cond)
 past = [ep(f"p{{i}}", "E0") for i in range(4)]
 ssha = write_blob(root, selection.candidates_blob(past))
 ctx = s.write_ctp_node("context_observation", {{"episode_id": e, "context_ref": "blob:" + "1" * 64, "knowledge_ids": [], "constraint_annotation_ids": [], "task_ref": "t", "contains_experience": False}}, producer=P)
-x = s.write_ctp_node("experience", selection.experience_fields(e, past, ssha, k=3, seed="child-seed", policy_id="u", policy_version="1", policy_fingerprint="f" * 64, presentation_mode="contrast", presentation_format={{"template_id": "t", "version": "1"}}), producer=P, input_nodes=(ctx,))
+x = s.write_ctp_node("experience", selection.experience_fields(e, past, ssha, k=3, seed="child-seed", policy_id="u", policy_version="1", presentation_mode="contrast", presentation_format={{"template_id": "t", "version": "1"}}), producer=P, input_nodes=(ctx,))
 s.add_edge("selects", a, e)
 print(json.dumps({{"ids": [a, e, x], "nodes": (root / "graph" / "nodes.jsonl").read_text(), "edges": (root / "graph" / "edges.jsonl").read_text()}}))
 """
