@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from graph.chainlog import ChainLog
+from graph.guard import GraphLock, Ledger, PeerNodes, edge_key, node_key, put
 from graph.model import GraphError
 
 SCHEMA = "hextproj/1"
@@ -234,21 +235,39 @@ class HextProjectionLayer:
             versions.setdefault(d["object"]["id"], []).append(d["final_seal"]["state_hash"])
         hashes = [d["final_seal"]["state_hash"] for d in loaded]
         claims = {d["final_seal"]["state_hash"]: {c["time_id"] for c in d["time"]["claims"]} for d in loaded}
+        # one lock for the whole data dir, the same one GraphStore writes under (D11, D13)
+        lock = GraphLock.of(self.root.parent)
+        with lock:
+            return self._write(lock, parsed, hashes, claims, merged, versions, resolve_session)
+
+    def _write(
+        self,
+        lock: GraphLock,
+        parsed: list[tuple[bytes, dict[str, Any]]],
+        hashes: list[str],
+        claims: dict[str, set[str]],
+        merged: int,
+        versions: dict[str, list[str]],
+        resolve_session: Callable[[str], str | None],
+    ) -> dict[str, Any]:
         tmp = self.root.with_name("hext_projection.tmp")
         if tmp.exists():
             shutil.rmtree(tmp)
         nodes, edges, unres = ChainLog(tmp / "nodes.jsonl"), ChainLog(tmp / "edges.jsonl"), ChainLog(tmp / "unresolved.jsonl")
-        seen_nodes: set[str] = set()
-        for raw, meta in parsed:
-            p = project_document(raw, resolve_session=resolve_session, known_doc_hashes=hashes, known_claims=claims, **meta)
-            for n in p["nodes"]:
-                if n["node_id"] not in seen_nodes:
-                    seen_nodes.add(n["node_id"])
-                    nodes.append(n)
-            for e in p["edges"]:
-                edges.append(e)
-            for u in p["unresolved"]:
-                unres.append(u)
+        node_ledger, edge_ledger = Ledger(nodes, node_key, "node"), Ledger(edges, edge_key, "edge")
+        main_nodes = PeerNodes(self.root.parent / "nodes.jsonl")  # the other entrance's node ids
+        try:
+            for raw, meta in parsed:
+                p = project_document(raw, resolve_session=resolve_session, known_doc_hashes=hashes, known_claims=claims, **meta)
+                for n in p["nodes"]:
+                    put(lock, node_ledger, n, peers=[main_nodes])
+                for e in p["edges"]:
+                    put(lock, edge_ledger, e)
+                for u in p["unresolved"]:
+                    unres.append(u)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)  # a refused rebuild leaves the committed layer as it was
+            raise
         for log in (nodes, edges, unres):
             log.sync()
         manifest = {"schema": SCHEMA, "documents": len(parsed), "duplicates_merged": merged,
