@@ -1,0 +1,18 @@
+{
+ "source": "sensos contracts/ic00-v1.0.0 (c82918f), tools/contracts",
+ "note": "ids.py/jcs.py/errors.py copied; only the import lines changed ('contracts.x' -> relative). Identical in sensos feature/contracts-ic00-v110 (c0064c8) for ids.py and jcs.py.",
+ "files": {
+  "errors.py": {
+   "source_sha256": "63ecc07b6069e620e093c78ba5a1398e24b3440cd7c7ad28fd4203ef38fa1df5",
+   "vendored_sha256": "63ecc07b6069e620e093c78ba5a1398e24b3440cd7c7ad28fd4203ef38fa1df5"
+  },
+  "jcs.py": {
+   "source_sha256": "6f98c150c1398462524fea0907c779ed71192ba1e54ed0fb2f6b0dc62803f7e0",
+   "vendored_sha256": "6038940ce036b0042065d3d0dedecf3640f997b38d0baec8e54bbea6b6e0e676"
+  },
+  "ids.py": {
+   "source_sha256": "157b0d19d288989dd65ae8b40483af086e802332e281bb79084991ed89e4be85",
+   "vendored_sha256": "a2189ee64d36a0323a4cb84581f386543c3b556903098edb071e4d25bbbf558b"
+  }
+ }
+}
