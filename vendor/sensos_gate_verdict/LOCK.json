@@ -1,0 +1,14 @@
+{
+ "source": "sensos feature/u6t-gate-verdict (4e5a75d), docs/architecture/contracts/nvs/gate-verdict.schema.json (gate-verdict/1, U6T-1a)",
+ "note": "gate-verdict.schema.json is a byte-for-byte copy. validate.py is authored in hekb-vnext (no source file): hekb-vnext has no jsonschema, so it implements the keywords the schema uses (and refuses a schema that uses others); it is checked against jsonschema in tests/test_gate_verdict_vendor.py. jcs.py for the envelope_sha256 / verdict_sha256 is the existing vendor/sensos_ic00/jcs.py (LOCK there).",
+ "files": {
+  "gate-verdict.schema.json": {
+   "source_sha256": "5cfc1a36f069f34ea54ac70cb9ae40079ae7f595a598db6d24a7b0b54c508527",
+   "vendored_sha256": "5cfc1a36f069f34ea54ac70cb9ae40079ae7f595a598db6d24a7b0b54c508527"
+  },
+  "validate.py": {
+   "source_sha256": null,
+   "vendored_sha256": "6004a853d4341f56fdcbd8adfb77420fa87c40f81246c8a01dd25511a68a208d"
+  }
+ }
+}
