@@ -28,7 +28,12 @@ from typing import Any
 
 from graph import formal
 from graph.blobs import read_blob, write_blob
-from graph.chainlog import ChainLog
+from graph.chainlog import (
+    ChainChangedExternally,
+    ChainLog,
+    GuardedChainLog,
+    TornTailError,
+)
 from vendor.sensos_ic00 import ids as _ids
 from vendor.sensos_ic00.errors import ContractError
 
@@ -46,7 +51,8 @@ class IC04Error(Exception):
     formal_store_needs_require_formal, formal_store_not_empty, formal_store_required, formal_store_quarantined, gate_ref_not_accepted,
     payload_schema_not_accepted, gate_required, gate_verdict_malformed, gate_catalog_mismatch, gate_subject_mismatch, gate_rule_mismatch,
     gate_lookup_mismatch, calibration_unknown, gate_rejected, gate_unverified_not_allowed, gate_waived_not_allowed,
-    checker_bundle_missing, checker_bundle_mismatch, recall_not_supported_in_formal_store."""
+    checker_bundle_missing, checker_bundle_mismatch, recall_not_supported_in_formal_store, store_changed_externally,
+    torn_tail_not_set_aside; a violation (quarantine) code: formal_pending_not_empty."""
 
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}" if detail else code)
@@ -92,10 +98,11 @@ class IC04Store:
         self.data_dir = Path(data_dir)
         self.formal: dict[str, Any] | None = None      # the declaration of a Formal Store
         self.violations: list[dict[str, Any]] = []     # records that break the declaration (non-empty = quarantined)
-        self.log = ChainLog(self.data_dir / "graph" / "ic00_envelopes.jsonl")
+        self.log: ChainLog = (GuardedChainLog if require_formal else ChainLog)(self.data_dir / "graph" / "ic00_envelopes.jsonl")
         self.pending = ChainLog(self.data_dir / "graph" / "ic00_pending.jsonl")
         self._index: dict[str, dict[str, Any]] = {}
-        lines = list(self.log.verify())
+        # a Formal Store reads its chain leniently (a torn last line is set aside after the declaration is checked); a legacy store strictly
+        lines = list(self.log.open_lines) if isinstance(self.log, GuardedChainLog) else list(self.log.verify())
         declared = bool(lines) and isinstance(lines[0]["record"], dict) and "ic04_store" in lines[0]["record"]
         if require_formal:
             self._open_formal(lines, accepted_versions, missing_parents)
@@ -141,10 +148,19 @@ class IC04Store:
             raise IC04Error("formal_open_args_conflict", f"accepted_versions {list(accepted_versions)} is not the declaration's {decl['accepted_versions']}")
         if missing_parents is not None and missing_parents != decl["missing_parents"]:
             raise IC04Error("formal_open_args_conflict", f"missing_parents {missing_parents!r} is not the declaration's {decl['missing_parents']!r}")
+        assert isinstance(self.log, GuardedChainLog)
+        if self.log.torn is not None:               # U6T-2b-a: evidence first, cut last; any failure = the store does not open, the file is unchanged
+            try:
+                self.log.set_aside_torn_tail()
+            except TornTailError as ex:
+                raise IC04Error("torn_tail_not_set_aside", str(ex)) from ex
         self.formal = copy.deepcopy(decl)
         self.accepted_versions = tuple(decl["accepted_versions"])
         self.missing_parents = decl["missing_parents"]
         self.event_contract_version = self.accepted_versions[0]
+        if any(True for _ in self.pending.verify()):   # a Formal Store never holds (missing_parents is 'reject'): a pending line is a way around that
+            self.violations.append({"hekb_seq": None, "artifact_id": None, "code": "formal_pending_not_empty",
+                                    "detail": "ic00_pending.jsonl has a line; a Formal Store keeps nothing pending"})
         for line in lines[1:]:                      # 5: every record keeps the declaration's promise; the ones that do not are listed
             record = line["record"]
             aid = record.get("artifact_id") if isinstance(record, dict) else None
@@ -187,6 +203,10 @@ class IC04Store:
             return None
         env = line["record"]["envelope"]
         return {"content_id": env["content_id"], "seq": env["seq"], "observation_id": env["observation_id"]}
+
+    def torn_tails(self) -> list[dict[str, Any]]:
+        """The last lines that were found cut off and set aside (graph/quarantine/torn_tails.jsonl). A Formal Store only."""
+        return self.log.torn_records() if isinstance(self.log, GuardedChainLog) else []
 
     @property
     def is_formal(self) -> bool:
@@ -286,6 +306,9 @@ class IC04Store:
         C-8a the checker bundle is a blob of the store (or is given) | C-8 write. The same artifact_id with the same envelope returns the
         stored receipt (the first verdict wins); with another envelope it is a ``conflict``."""
         assert self.formal is not None
+        assert isinstance(self.log, GuardedChainLog)
+        if self.log.dead:                                                                           # U6T-2b-a: a handle that saw another writer never writes again
+            raise IC04Error("store_changed_externally", self.log.dead)
         if self.violations:                                                                         # C-0
             raise IC04Error("formal_store_quarantined", f"{len(self.violations)} record(s) break the declaration")
         if gate_ref is not None:
@@ -317,6 +340,10 @@ class IC04Store:
             raise IC04Error("checker_bundle_mismatch", "the given bundle is not the one the verdict names")
         if not stored_bundle and checker_bundle is None:
             raise IC04Error("checker_bundle_missing", f"the bundle {bundle_sha} is not in the store and was not given")
+        try:
+            self.log.check_unchanged()                                                              # before the first byte is written (U6T-2b-a)
+        except ChainChangedExternally as ex:
+            raise IC04Error("store_changed_externally", str(ex)) from ex
         for data in blobs.values():                                                                 # C-8
             write_blob(self.data_dir, data)
         if not stored_bundle:
@@ -324,7 +351,10 @@ class IC04Store:
             write_blob(self.data_dir, checker_bundle)
         rec = {"artifact_id": aid, "content_id": envelope["content_id"], "envelope": copy.deepcopy(envelope), "blob_shas": shas,
                "ic04": {"gate_verdict": verdict, "checker_bundle_sha256": bundle_sha}}
-        line = self.log.append(rec, sync=True)
+        try:
+            line = self.log.append(rec, sync=True)
+        except ChainChangedExternally as ex:
+            raise IC04Error("store_changed_externally", str(ex)) from ex
         self._index[aid] = line
         return self._receipt(line, already=False)
 
