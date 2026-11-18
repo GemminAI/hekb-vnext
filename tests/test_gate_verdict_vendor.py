@@ -2,8 +2,8 @@
 
 Always run: the LOCK, the validator on the verdicts of ``gv_support``, a schema with a keyword the validator lacks.
 Opt-in (skipped, with the reason, otherwise): ``GATE_PY`` (an interpreter with ``jsonschema``) to check the validator against
-``jsonschema`` on many damaged verdicts; ``SENSOS_TOOLS`` to check the copy against sensos's file; the U6T-1d evidence of a real run
-to check that the form made here has the keys of a real verdict.
+``jsonschema`` on many damaged verdicts; ``SENSOS_TOOLS`` to check the copy against sensos's file; ``GATE_VERDICT_EVIDENCE_DIR``
+for a real-run verdict, to check that the form made here has the keys of a real verdict.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from vendor.sensos_gate_verdict.validate import Validator, verdict_errors
 
 VENDOR = Path(validate.__file__).parent
 SCHEMA_RELATIVE = "docs/architecture/contracts/nvs/gate-verdict.schema.json"
-EVIDENCE = Path.home() / "vaults/20260124/experiment-evidence/U6T-1-RUN"
+EVIDENCE_ENV = "GATE_VERDICT_EVIDENCE_DIR"
 
 
 def _sha(path: Path) -> str:
@@ -83,9 +83,12 @@ def _shape(x: Any, opaque: tuple[str, ...] = ("lookup", "packages")) -> Any:
 
 
 def test_the_form_made_here_has_the_keys_of_a_real_verdict_of_u6t1d() -> None:
-    found = sorted(EVIDENCE.glob("u6t1-*/verdicts/final_norm.json"))
+    raw = os.environ.get(EVIDENCE_ENV)
+    if not raw:
+        pytest.skip(f"{EVIDENCE_ENV} is not set")
+    found = sorted(Path(raw).glob("u6t1-*/verdicts/final_norm.json"))
     if not found:
-        pytest.skip(f"no U6T-1d evidence under {EVIDENCE.name}")
+        pytest.skip(f"{EVIDENCE_ENV} has no matching verdicts")
     real = json.loads(found[-1].read_text(encoding="utf-8"))
     mine = make_verdict(make_env())
 
