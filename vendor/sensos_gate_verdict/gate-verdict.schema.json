@@ -53,12 +53,12 @@
           "required": ["status", "kind", "codes"],
           "properties": {
             "status": { "enum": ["PASS", "PASS_UNVERIFIED", "FAIL", "not_run"] },
-            "kind": { "enum": ["hidden_trajectory", "ic02", null] },
+            "kind": { "enum": ["hidden_trajectory", "ic02", "meaning_frame", "meaning_measurement", null] },
             "codes": { "$ref": "#/$defs/codes" }
           },
           "if": { "properties": { "status": { "const": "not_run" } }, "required": ["status"] },
           "then": { "properties": { "kind": { "const": null }, "codes": { "maxItems": 0 } } },
-          "else": { "properties": { "kind": { "enum": ["hidden_trajectory", "ic02"] } } }
+          "else": { "properties": { "kind": { "enum": ["hidden_trajectory", "ic02", "meaning_frame", "meaning_measurement"] } } }
         },
         "L3": {
           "type": "object",
