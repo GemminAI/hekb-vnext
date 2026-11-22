@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip(
+    "sensos_inference",
+    reason="d71 の harness は観測層の sensos_inference に依存する。hekb-vnext だけの環境には無い",
+)
+
 import json
 from pathlib import Path
 from types import SimpleNamespace
