@@ -1,0 +1,594 @@
+"""HEKBV3-BUILD002 §2: ingests Mac-side BoardRecord shards (nvs-runtime replay executor
+output, /media/psf/HEKBv3/exp_hekbv3_boardrecords/) into a hekb-vnext-v3 data directory via
+the real /v3/blobs + /v3/trajectories HTTP validation path (blob content-hash check, audit
+signature check, idempotent-by-content object_id) -- never a bypass of that path.
+
+Input layout (per the Mac-side task's own §2/§3, plus `model_ref`/`layer` added by the
+2026-10-08 follow-up instruction):
+  <root>/manifest.json: {"sessions": [{"session_id","category","group","split","n_records",
+    "file"}, ...], "board_format", "quant_step_log2", "wiring_policy_sha256", "time_policy_sha256", "format_version", "projection_sha256",
+    "w_sha256", "anchor_policy_sha256", "model_ref", "layer", ...commits/sha256s (read but
+    not re-verified here beyond the per-session n_records/anchor_policy_sha256 checks
+    below)}.
+  <root>/<file> (e.g. validation48/<session_id>.jsonl.gz or sessions/<session_id>.jsonl.gz):
+    one JSON object per line, each BoardRecord.to_wire() (nvs_edge/record.py), in token
+    order, over the 32 non-excluded ports (CORE_IDS).
+
+[HEKBV3-BUILD002, 2026-10-08 follow-up, disclosed]: `model_ref`/`layer` are read FROM
+manifest.json when present (no longer CLI flags). `model_ref` is REQUIRED to be present; if
+missing, this script substitutes the literal "不明" and reports it (does not stop) -- per the
+explicit instruction, since the identifier lives in the *source* data (MSD0001 meta.json /
+CDM-DATA001 selection_manifest.json), not something this script can derive on its own.
+
+[HEKBV3-BUILD002 続き, 2026-10-08, disclosed]: the real Mac-produced manifest.json files
+(sessions/, validation48/) have NEITHER `layer` NOR `model_ref`. Per the explicit instruction
+("manifest を変更せず...ingest_context.json を新設"), manifest.json is never edited to add
+them; instead this script also looks for an optional sibling file,
+<manifest's own directory>/ingest_context.json, and uses its "layer"/"model_ref" fields when
+the manifest itself lacks them. `layer` is still hard-required overall (manifest OR context;
+raises if neither has it) -- its value is well-established (32, layer_index 7: confirmed from
+/media/psf/HEKBv3/trj003_48/manifest.json's own layer_number/layer_index fields). `model_ref`
+falls back further to "不明"+report only if BOTH manifest and ingest_context.json lack it.
+Confirmed on this VM (see /media/psf/HEKBv3/exp_hekbv3_boardrecords/ingest_context.json for
+the committed values and provenance):
+  model_id = "meta-llama/Llama-3.1-8B-Instruct", revision = "0e9e39f249a16976918f6564b8830bc894c89659"
+(source: /media/psf/EXP-MSD0001 v1.1/sessions/*/meta.json "model" field, cross-checked across
+3 sessions, identical; corroborated by
+/media/psf/sensos-experiments/CDM-DATA001/selection_manifest.json "model" field).
+
+[HEKBV3-BUILD002, disclosed design]: runs the real store_service ASGI app through
+starlette's TestClient (same mechanism as tests/test_v3_trajectory.py), pointed at
+--data-dir via HEKB_DATA_DIR, with an ephemeral EC keypair generated for audit-signature
+verification -- not a separately bound TCP port. This is a stronger form of "disposable
+process / separate port": no port is bound at all, so there is no possibility of
+colliding with the real 8300 service or any 8301+ instance. The 8300 service is never
+imported, started, or contacted by this script.
+
+Value-less cells (board-42-v2; docs/INGEST_BOARDRECORDS.md): a cell the board format defines
+without a value field (P15) arrives as `null`. By default the run STOPS with an IngestError that
+names the cell and `--drop-valueless-columns`; with that option the column is left out (37
+columns) and recorded in the space fingerprint (`space.excluded_columns`) and in
+`ext.hekbv3.ports.excluded_columns`. Nothing is stored as 0 or NaN. What a missing value means to
+HEKB in general is not decided here.
+
+Stops (raises, no retry) on: a shard's actual record count != manifest's n_records, a
+session with inconsistent anchor_policy_sha256 across its own records, a session's cells
+not forming a single consistent port_ids order, or any non-2xx HTTP response. Never writes
+to HEKBv3/experience or exp_hekbv3 (only ever acts on the caller-supplied --data-dir).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import gzip
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+
+class IngestError(RuntimeError):
+    pass
+
+
+MODEL_REF_UNKNOWN = "不明"
+
+
+def _load_ingest_context(manifest_path: Path) -> dict:
+    """Optional context file supplying layer/model_ref without editing manifest.json (see
+    module docstring's 2026-10-08 続き note). The task places this one level above the
+    manifest (.../exp_hekbv3_boardrecords/ingest_context.json, shared by both sessions/ and
+    validation48/ manifests), so this checks the manifest's own directory first, then its
+    parent. Returns {} when neither has the file."""
+    for candidate in (manifest_path.parent / "ingest_context.json",
+                      manifest_path.parent.parent / "ingest_context.json"):
+        if candidate.is_file():
+            return json.loads(candidate.read_text())
+    return {}
+
+
+def _load_manifest(manifest_path: Path) -> tuple[dict, bool]:
+    """Returns (manifest, model_ref_was_missing). `layer` is required overall (from manifest
+    itself, or failing that from the sibling ingest_context.json -- see _load_ingest_context);
+    raises if neither has it. `model_ref` falls back the same way, then to MODEL_REF_UNKNOWN
+    (reported, not a stop) if still absent."""
+    manifest = json.loads(manifest_path.read_text())
+    required = (
+        "sessions", "board_format", "quant_step_log2", "anchor_policy_sha256",
+        "wiring_policy_sha256", "time_policy_sha256",
+    )
+    missing = [k for k in required if k not in manifest]
+    if missing:
+        raise IngestError(f"manifest.json missing required field(s): {missing}")
+    if not isinstance(manifest["sessions"], list) or not manifest["sessions"]:
+        raise IngestError("manifest.json 'sessions' must be a non-empty list")
+    for i, s in enumerate(manifest["sessions"]):
+        missing_s = [k for k in ("session_id", "category", "group", "split", "n_records", "file") if k not in s]
+        if missing_s:
+            raise IngestError(f"manifest.json sessions[{i}] missing field(s): {missing_s}")
+
+    context = _load_ingest_context(manifest_path)
+    manifest = dict(manifest)
+    if "layer" not in manifest:
+        if "layer" not in context:
+            raise IngestError(
+                "manifest.json missing required field(s): ['layer'] "
+                "(no ingest_context.json sibling file supplying it either)"
+            )
+        manifest["layer"] = context["layer"]
+
+    model_ref_was_missing = not manifest.get("model_ref")
+    if model_ref_was_missing:
+        if context.get("model_ref"):
+            manifest["model_ref"] = context["model_ref"]
+            model_ref_was_missing = False
+        else:
+            manifest["model_ref"] = MODEL_REF_UNKNOWN
+    return manifest, model_ref_was_missing
+
+
+def _read_shard(shard_path: Path) -> list[dict]:
+    if not shard_path.exists():
+        raise IngestError(f"shard file not found: {shard_path}")
+    with gzip.open(shard_path, "rt", encoding="utf-8") as fh:
+        lines = [line for line in fh.read().splitlines() if line]
+    return [json.loads(line) for line in lines]
+
+
+def _find_raw_log_file(raw_logs_root: Path, session_id: str) -> Path:
+    """[HEKBV3-BUILD004] Locates the raw per-token log for `session_id` under
+    `raw_logs_root` (the Mac-side TRJ003 replay output, e.g. .../trj003_48/results_vm).
+    Raw files are named `<prefix>_<NNN>_<session_id>.jsonl.gz` (msd_session_id is the
+    filename's own suffix, not a separate index) -- matched by glob, not by trusting any
+    pre-existing index file, so this is self-contained and verifiable from the raw files
+    alone. Exactly one match is required; zero or more than one is a stop condition (the
+    task's own "原因の箇所が1つに絞れない" rule applies equally to this join)."""
+    candidates = sorted((raw_logs_root / "sessions").glob(f"*_{session_id}.jsonl.gz"))
+    if len(candidates) == 0:
+        raise IngestError(f"session {session_id}: no raw log file found under {raw_logs_root / 'sessions'}")
+    if len(candidates) > 1:
+        raise IngestError(f"session {session_id}: ambiguous raw log match: {candidates}")
+    return candidates[0]
+
+
+def _slot(raw_rec: dict, key: str, why: str):
+    """PRESENT with the original value, or MISSING with a reason -- never an empty fill-in."""
+    if key in raw_rec and raw_rec[key] is not None:
+        return {"status": "PRESENT", "value": raw_rec[key]}
+    return {"status": "MISSING", "value": None, "missing_reason": why}
+
+
+def _read_raw_causal_log(raw_logs_root: Path, session_id: str, board_records: list[dict]) -> tuple[list[dict], str, str]:
+    """[HEKBV3-BUILD004 + CAUSAL-ALIGN002 provenance contract v2] Reads the raw TRJ003 per-token
+    log matching `session_id`, checks it 1:1 against the already-validated BoardRecord shard
+    (same (token_index, seq) order -- the join key, verified rather than assumed), and returns
+    (per-token causal-log records, raw_file_relative_path, raw_file_sha256).
+
+    Each record keeps, in `provenance`, three things SEPARATELY: the reference to the raw record
+    (file sha256 + line number + sha256 of the raw line; the path is auxiliary), the token identity
+    (gen.token_id and the step index as different fields), and `cycle_provenance` / `position_64d`
+    verbatim (or MISSING + reason). HEXT is recorded as a reference only (the document is not
+    stored and is never reconstructed).
+
+    Duplicate raw lines: an identical repeat of an earlier line (same token_index, same bytes) is a
+    legitimate retry -- kept once, noted in `provenance.duplicates`; a repeat with different content
+    is a conflict and stops the ingest."""
+    raw_path = _find_raw_log_file(raw_logs_root, session_id)
+    raw_bytes = raw_path.read_bytes()
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    with gzip.open(raw_path, "rt", encoding="utf-8") as fh:
+        raw_lines = [(n, line) for n, line in enumerate(fh.read().splitlines(), start=1) if line]
+    kept: list[tuple[int, str, list[dict]]] = []
+    by_token: dict[int, tuple[str, int]] = {}
+    for n, line in raw_lines:
+        tok = json.loads(line).get("token_index")
+        digest = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        if tok in by_token:
+            first_digest, first_pos = by_token[tok]
+            if first_digest == digest:
+                kept[first_pos][2].append({"line_number": n, "record_sha256": digest, "kind": "identical_retry"})
+                continue
+            raise IngestError(
+                f"session {session_id}: raw log line {n} repeats token_index={tok} with DIFFERENT content "
+                f"(conflicting duplicate; line {kept[first_pos][0]} vs {n})"
+            )
+        by_token[tok] = (digest, len(kept))
+        kept.append((n, line, []))
+    if len(kept) != len(board_records):
+        raise IngestError(
+            f"session {session_id}: raw log {raw_path} has {len(kept)} distinct records, "
+            f"BoardRecord shard has {len(board_records)}"
+        )
+    rel_path = str(raw_path.relative_to(raw_logs_root))
+    out: list[dict] = []
+    for (line_number, line, dups), board_rec in zip(kept, board_records):
+        raw_rec = json.loads(line)
+        if raw_rec.get("token_index") != board_rec["token_index"] or raw_rec.get("seq") != board_rec["seq"]:
+            raise IngestError(
+                f"session {session_id}: raw log line {line_number} "
+                f"(token_index={raw_rec.get('token_index')}, seq={raw_rec.get('seq')}) does not align "
+                f"with BoardRecord shard entry (token_index={board_rec['token_index']}, seq={board_rec['seq']})"
+            )
+        for field in ("ports", "cycle_raw", "trajectory_hash"):
+            if field not in raw_rec:
+                raise IngestError(f"session {session_id}: raw log line {line_number} missing {field!r}")
+        gen = raw_rec.get("gen")
+        if isinstance(gen, dict) and "token_id" in gen:
+            token = {"status": "PRESENT", "value": {"token_id": gen["token_id"], "step_index": raw_rec["token_index"],
+                                                   "gen": gen}}
+        else:
+            token = {"status": "MISSING", "value": None,
+                     "missing_reason": "raw record has no gen.token_id"}
+        hext = (raw_rec["cycle_raw"] or {}).get("hext") or {}
+        prov = {
+            "schema": "hekbv3.causal_log.provenance/1",
+            "values_origin": "ingest_time_raw_log",
+            "raw_ref": {
+                "file_sha256": raw_sha256, "line_number": line_number,
+                "record_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(), "path_aux": rel_path,
+            },
+            "token": token,
+            "cycle_provenance": _slot(raw_rec, "cycle_provenance", "raw record has no cycle_provenance"),
+            "position_64d": _slot(raw_rec, "position_64d", "raw record has no position_64d"),
+            "hext": {"kind": "reference_only", "object_id": hext.get("object_id"), "document": "NOT_STORED"},
+        }
+        if dups:
+            prov["duplicates"] = dups
+        out.append({
+            "token_index": raw_rec["token_index"], "seq": raw_rec["seq"],
+            "trajectory_hash": raw_rec["trajectory_hash"], "ports": raw_rec["ports"],
+            "cycle_raw": raw_rec["cycle_raw"],
+            "source_file": {"path": rel_path, "sha256": raw_sha256},
+            "line_number": line_number,
+            "provenance": prov,
+        })
+    return out, rel_path, raw_sha256
+
+
+def _valueless_ports(records: list[dict]) -> list[str]:
+    """Ports whose cell carries no value (`null` in the wire form: board-42-v2's P15) in at least
+    one record, in cell order. A value-less cell is a cell the board format defines without a
+    value field; it is never a number (not 0, not NaN) and is not guessed here."""
+    found: dict[str, None] = {}
+    for rec in records:
+        for cell in rec["cells"]:
+            if cell[2] is None:
+                found[cell[0]] = None
+    return list(found)
+
+
+def _valueless_refusal(session_id: str, ports: list[str], board_format: str | None) -> IngestError:
+    names = ", ".join(ports)
+    return IngestError(
+        f"session {session_id}: cell(s) {names} carry no value (value=null; board_format "
+        f"{board_format!r} defines them as value-less cells, e.g. P15 in board-42-v2). Refusing to "
+        f"invent a value. Re-run with --drop-valueless-columns to ingest without the column(s) "
+        f"{names}; they are then recorded in the space fingerprint (excluded_columns) and in the "
+        f"trajectory metadata (ext.hekbv3.ports.excluded_columns). What a missing value means to "
+        f"HEKB in general is not decided here."
+    )
+
+
+def _scan_valueless(sessions: list[dict], shards_root: Path, board_format: str | None, drop: bool) -> list[str]:
+    """Pre-scan every shard in scope (the space, and so the space_id, is computed before any
+    session is ingested). Returns the value-less ports, identical for every session. Without
+    `drop` any value-less cell stops the run with a message that names the option."""
+    expected: list[str] | None = None
+    for s in sessions:
+        ports = _valueless_ports(_read_shard(shards_root / s["file"]))
+        if ports and not drop:
+            raise _valueless_refusal(s["session_id"], ports, board_format)
+        if expected is None:
+            expected = ports
+        elif ports != expected:
+            raise IngestError(
+                f"session {s['session_id']}: value-less cells {ports} differ from the other sessions' "
+                f"{expected}; one run ingests one space, so every session must have the same value-less columns"
+            )
+    return expected or []
+
+
+def _session_ports_matrix(
+    records: list[dict], session_id: str, expected_anchor_policy: str, dropped: tuple[str, ...] = ()
+) -> tuple[list[list[int]], list[str]]:
+    """Validates internal consistency of one session's BoardRecord lines and returns
+    (rows: n_steps x n_ports int64 cell values, in token order; port_ids: the fixed cell
+    order, read from the first record). `dropped` names the value-less columns left out
+    (`--drop-valueless-columns`); each must be `null` in every record. Any other non-integer
+    value is an IngestError here, never an error from the blob encoder."""
+    if not records:
+        raise IngestError(f"session {session_id}: shard has zero records")
+
+    all_ports = [cell[0] for cell in records[0]["cells"]]
+    keep = [i for i, p in enumerate(all_ports) if p not in dropped]
+    port_ids = [all_ports[i] for i in keep]
+    rows: list[list[int]] = []
+    prev_token_index = -1
+    for rec in records:
+        if rec.get("session_id") != session_id:
+            raise IngestError(f"session {session_id}: shard contains a record with session_id={rec.get('session_id')!r}")
+        if rec.get("anchor_policy_sha256") != expected_anchor_policy:
+            raise IngestError(
+                f"session {session_id}: record token_index={rec.get('token_index')} has "
+                f"anchor_policy_sha256={rec.get('anchor_policy_sha256')!r}, expected {expected_anchor_policy!r}"
+            )
+        these_ports = [cell[0] for cell in rec["cells"]]
+        if these_ports != all_ports:
+            raise IngestError(f"session {session_id}: cell port order is not consistent across records")
+        token_index = rec["token_index"]
+        if token_index <= prev_token_index:
+            raise IngestError(
+                f"session {session_id}: token_index did not strictly increase "
+                f"({prev_token_index} -> {token_index})"
+            )
+        prev_token_index = token_index
+        for i, cell in enumerate(rec["cells"]):
+            if all_ports[i] in dropped:
+                if cell[2] is not None:
+                    raise IngestError(
+                        f"session {session_id}: column {all_ports[i]} is dropped as value-less but record "
+                        f"token_index={token_index} has the value {cell[2]!r}"
+                    )
+            elif isinstance(cell[2], bool) or not isinstance(cell[2], int):
+                raise IngestError(
+                    f"session {session_id}: record token_index={token_index} cell {all_ports[i]} has a "
+                    f"non-integer value {cell[2]!r}"
+                )
+        rows.append([rec["cells"][i][2] for i in keep])
+    return rows, port_ids
+
+
+def _generate_dev_signer():
+    """Same throwaway-EC-keypair pattern as tests/test_v3_trajectory.py's `client` fixture:
+    a fresh key per ingest run, never the real audit key, never written to a shared path."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    numbers = private_key.public_key().public_numbers()
+    raw_point = b"\x04" + numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big")
+
+    def sign(payload: dict, canonical_bytes_fn) -> str:
+        message = canonical_bytes_fn(payload)
+        signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+        return base64.b64encode(signature).decode("ascii")
+
+    return raw_point, sign
+
+
+def run_ingest(
+    *, manifest_path: Path, shards_root: Path, data_dir: Path,
+    only_session_ids: set[str] | None = None, progress_every: int = 50,
+    raw_logs_root: Path | None = None, drop_valueless_columns: bool = False,
+) -> dict:
+    """[HEKBV3-BUILD004] `raw_logs_root`, when given, points at the Mac-side TRJ003 replay
+    output (e.g. .../trj003_48/results_vm) that the BoardRecord shards under `shards_root`
+    were themselves derived from. When set, EVERY session in scope must have a matching
+    raw log (see `_find_raw_log_file`/`_read_raw_causal_log`) -- a missing or misaligned
+    raw log is a stop condition, same severity as the existing n_records/anchor_policy
+    checks, not a silently-skipped session. The resulting `ext.hekbv3.causal_log` blob is
+    what D-03/D-24 call for and `ports`/`cells` alone never carried (see module docstring)."""
+    import os
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    public_key_path = data_dir / ".ingest_dev_public_key.raw"
+    raw_point, sign = _generate_dev_signer()
+    public_key_path.write_bytes(raw_point)
+
+    os.environ["HEKB_DATA_DIR"] = str(data_dir)
+    os.environ["HEKB_AUDIT_PUBLIC_KEY_PATH"] = str(public_key_path)
+
+    import store_service  # noqa: E402  (imported after env vars are set; _data_dir() etc. read them lazily anyway)
+    from starlette.testclient import TestClient
+
+    from storage.trajectory_blob import DTYPE_INT64, encode_trajectory_blob
+    from storage.causal_log_blob import encode_causal_log_blob
+
+    manifest, model_ref_was_missing = _load_manifest(manifest_path)
+    quant_step_log2 = manifest["quant_step_log2"]
+    board_format = manifest["board_format"]
+    manifest_anchor_policy = manifest["anchor_policy_sha256"]
+    model_ref = manifest["model_ref"]
+    layer = manifest["layer"]
+    if model_ref_was_missing:
+        print(f"[ingest_boardrecords] REPORT: manifest.json has no model_ref; using {MODEL_REF_UNKNOWN!r}", flush=True)
+
+    space = {
+        "model_ref": model_ref, "layer": layer,
+        "projection_sha256": manifest.get("projection_sha256", "0" * 64),
+        "w_sha256": manifest.get("w_sha256", "0" * 64),
+        "anchor_policy_sha256": manifest_anchor_policy,
+        "wiring_policy_sha256": manifest["wiring_policy_sha256"],
+        "time_policy_sha256": manifest["time_policy_sha256"],
+        "board_format": board_format, "quant_step_log2": quant_step_log2,
+    }
+    # value-less columns (board-42-v2's P15): refused unless --drop-valueless-columns; when dropped
+    # they are part of the space fingerprint and of each trajectory's metadata, never silent.
+    scope = manifest["sessions"]
+    if only_session_ids is not None:
+        scope = [s for s in scope if s["session_id"] in only_session_ids]
+    excluded = _scan_valueless(scope, shards_root, board_format, drop_valueless_columns)
+    if excluded:
+        space["excluded_columns"] = ",".join(f"{p}=valueless" for p in sorted(excluded))
+
+    token = "ingest-dev-token"
+    store_service._bearer_guard.token = token
+    client = TestClient(store_service.app, headers={"Authorization": f"Bearer {token}"})
+
+    space_resp = client.post("/v3/space-id", json=space)
+    if space_resp.status_code != 200:
+        raise IngestError(f"/v3/space-id failed: {space_resp.status_code} {space_resp.text}")
+    space_id = space_resp.json()["space_id"]
+
+    results: list[dict] = []
+    sessions = manifest["sessions"]
+    if only_session_ids is not None:
+        sessions = [s for s in sessions if s["session_id"] in only_session_ids]
+
+    for i, s in enumerate(sessions, start=1):
+        session_id = s["session_id"]
+        shard_path = shards_root / s["file"]
+        records = _read_shard(shard_path)
+        if len(records) != s["n_records"]:
+            raise IngestError(
+                f"session {session_id}: shard has {len(records)} records, "
+                f"manifest declares n_records={s['n_records']}"
+            )
+        rows, port_ids = _session_ports_matrix(records, session_id, manifest_anchor_policy, tuple(excluded))
+
+        # created_at_ms=0 (fixed, not wall-clock): the blob's bytes -- and therefore its
+        # sha256 and the resulting object_id -- must be identical on every re-run for the
+        # same shard content (task's own "冪等（再実行しても同じ object_id）"). The real
+        # creation time already lives in the BoardRecord data itself, not in this wrapper.
+        file_bytes, _header = encode_trajectory_blob(rows, dimensions=len(port_ids), dtype=DTYPE_INT64, created_at_ms=0)
+        blob_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        blob_resp = client.put(f"/v3/blobs/{blob_sha256}", content=file_bytes,
+                                headers={"Content-Type": "application/octet-stream"})
+        if blob_resp.status_code != 201:
+            raise IngestError(f"session {session_id}: PUT /v3/blobs failed: {blob_resp.status_code} {blob_resp.text}")
+
+        ports_meta: dict = {
+            "blob_sha256": blob_sha256, "n_steps": len(rows), "dim": len(port_ids),
+            "port_ids": port_ids, "quant_step_log2": quant_step_log2,
+        }
+        if excluded:
+            ports_meta["excluded_columns"] = [{"port_id": p, "reason": "valueless"} for p in excluded]
+        ext_hekbv3 = {
+            "kind": "trajectory", "origin": "experience",
+            "space": {**space, "space_id": space_id},
+            "ports": ports_meta,
+            "labels": {"category": s["category"], "split": s["split"], "group": s["group"]},
+            "outcome": {"result": "n/a"},
+        }
+
+        # [HEKBV3-BUILD004] causal_log: D-03/D-24's full 38-port causal log, sourced from
+        # the raw TRJ003 per-token logs (NOT from `causal_log_ref`/`cells`, neither of
+        # which carries the actual content -- see module docstring and REPORT).
+        if raw_logs_root is not None:
+            causal_records, raw_rel_path, raw_sha256 = _read_raw_causal_log(raw_logs_root, session_id, records)
+            causal_bytes, causal_blob_sha256 = encode_causal_log_blob(causal_records, schema="hekbv3.causal_log/2")
+            causal_resp = client.put(f"/v3/blobs/{causal_blob_sha256}", content=causal_bytes,
+                                      headers={"Content-Type": "application/octet-stream"})
+            if causal_resp.status_code != 201:
+                raise IngestError(
+                    f"session {session_id}: PUT /v3/blobs (causal_log) failed: "
+                    f"{causal_resp.status_code} {causal_resp.text}"
+                )
+            ext_hekbv3["causal_log"] = {
+                "blob_sha256": causal_blob_sha256, "n_steps": len(causal_records),
+                "schema": "hekbv3.causal_log/2",
+                "source_file": {"path": raw_rel_path, "sha256": raw_sha256},
+            }
+        else:
+            # feature/require-causal-log: the server now rejects a trajectory with no
+            # causal_log unless this is set -- true here, not a bypass: this ingest run
+            # was not given --raw-logs-root, so it genuinely has no raw per-token log to
+            # build one from (recorded on the stored experience, never silent).
+            ext_hekbv3["causal_log_omitted_reason"] = (
+                "ingested without --raw-logs-root; no raw per-token TRJ003 log was available"
+            )
+
+        payload = {
+            "schema": "hekb.experience/2",
+            "raw_input": f"boardrecord session={session_id}",
+            "resolved_meaning": None, "action": None, "title": session_id, "tags": ["boardrecord"],
+            "ext": {"hekbv3": ext_hekbv3},
+        }
+        sig = sign(payload, store_service.canonical_bytes)
+        resp = client.post("/v3/trajectories", json={"payload": payload}, headers={"X-Audit-Signature": sig})
+        if resp.status_code != 201:
+            raise IngestError(f"session {session_id}: POST /v3/trajectories failed: {resp.status_code} {resp.text}")
+        body = resp.json()
+        results.append({
+            "session_id": session_id, "object_id": body["object_id"],
+            "n_records": len(rows), "category": s["category"], "group": s["group"], "split": s["split"],
+            "has_causal_log": raw_logs_root is not None,
+        })
+        if i % progress_every == 0 or i == len(sessions):
+            print(f"[ingest_boardrecords] {i}/{len(sessions)} sessions ingested", flush=True)
+
+    return {
+        "space_id": space_id, "data_dir": str(data_dir), "n_sessions": len(results), "sessions": results,
+        "model_ref": model_ref, "model_ref_was_missing": model_ref_was_missing, "layer": layer,
+        "excluded_columns": list(excluded),
+        "nvs_kernel_commit": manifest.get("nvs_kernel_commit"),
+        "nvs_runtime_commit": manifest.get("nvs_runtime_commit"),
+    }
+
+
+def _git_commit_hash() -> str | None:
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _write_provenance_manifest(data_dir: Path, *, result: dict, manifest_path: Path,
+                                raw_logs_root: Path | None) -> None:
+    """[HEKBV3-BUILD004] Records THIS ingest run's own argv and the upstream
+    nvs-kernel/nvs-runtime commits (read from the source manifest.json, never written back
+    into it -- D-18: 記録は書き換えない) into a NEW file under the output data dir. Never
+    touches the source manifest.json or any existing report."""
+    import datetime
+
+    out = {
+        "note": "HEKBV3-BUILD004: provenance for this ingest run (argv + upstream commits). "
+                 "Does not modify manifest.json (D-18).",
+        "argv": sys.argv,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source_manifest_path": str(manifest_path),
+        "source_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "raw_logs_root": str(raw_logs_root) if raw_logs_root is not None else None,
+        "nvs_kernel_commit": result.get("nvs_kernel_commit"),
+        "nvs_runtime_commit": result.get("nvs_runtime_commit"),
+        "hekb_vnext_v3_commit": _git_commit_hash(),
+        "space_id": result["space_id"], "n_sessions": result["n_sessions"],
+    }
+    (data_dir / "ingest_manifest.json").write_text(json.dumps(out, indent=2))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--shards-root", type=Path, default=None,
+                         help="Directory the manifest's 'file' entries are relative to (default: manifest's own directory).")
+    parser.add_argument("--data-dir", required=True, type=Path,
+                         help="HEKB_DATA_DIR for this ingest (no default -- never points at production).")
+    parser.add_argument("--only", nargs="*", default=None, help="Restrict to these session_ids (default: all in manifest).")
+    parser.add_argument("--raw-logs-root", type=Path, default=None,
+                         help="Mac-side TRJ003 replay output root (e.g. .../trj003_48/results_vm) to pull the "
+                              "full 38-port causal log from. When given, every session in scope must have a "
+                              "matching raw log (stop on mismatch) -- see module docstring.")
+    parser.add_argument("--drop-valueless-columns", action="store_true",
+                         help="Ingest a board-42-v2 session whose value-less cell (P15, value null) has no "
+                              "number to store: leave that column out (37 columns). Default: refuse (IngestError). "
+                              "The dropped column(s) are recorded in the space fingerprint and in each "
+                              "trajectory's ext.hekbv3.ports.excluded_columns; their raw readings stay in the "
+                              "causal log when --raw-logs-root is given.")
+    args = parser.parse_args()
+
+    shards_root = args.shards_root or args.manifest.resolve().parent
+    only = set(args.only) if args.only else None
+    try:
+        result = run_ingest(
+            manifest_path=args.manifest, shards_root=shards_root, data_dir=args.data_dir,
+            only_session_ids=only, raw_logs_root=args.raw_logs_root,
+            drop_valueless_columns=args.drop_valueless_columns,
+        )
+    except IngestError as exc:
+        print(f"[ingest_boardrecords] STOP: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    _write_provenance_manifest(args.data_dir, result=result, manifest_path=args.manifest,
+                                raw_logs_root=args.raw_logs_root)
+    print(json.dumps({k: v for k, v in result.items() if k != "sessions"}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

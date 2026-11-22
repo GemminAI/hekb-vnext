@@ -90,10 +90,12 @@ from typing import Any
 
 from contextlib import asynccontextmanager
 
+import numpy as np
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 
 VENDOR_DIR = Path(__file__).resolve().parent / "vendor" / "hekb_vnext"
@@ -114,6 +116,13 @@ from memory.provenance import (  # noqa: E402
 )
 from auth.local_auth import BearerTokenGuard, generate_bearer_token  # noqa: E402
 from index.semantic_closure import compute_closure  # noqa: E402
+from index import compose as compose_mod  # noqa: E402
+from index import experience_index  # noqa: E402
+from index.space_id import SpaceIdError, compute_space_id  # noqa: E402
+from storage import blobs as blob_store  # noqa: E402
+from storage import causal_log_blob  # noqa: E402
+
+API_VERSIONS = ["hekb.experience/1", "hekb.experience/2", "v3-trajectory-experience-channel"]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8300
@@ -159,6 +168,25 @@ def _meta_dir() -> Path:
 def _ensure_layout() -> None:
     for d in (_objects_dir(), _relations_dir(), _lineages_dir(), _meta_dir()):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _blobs_dir() -> Path:
+    """Layer 4 (HEKBv3 改修設計書 v0.1 §3.3): lives alongside objects/relations/lineages/
+    meta under the same `_data_dir()` (shared-folder-capable when HEKB_DATA_DIR points
+    there) -- unlike the index (Layer 5), blobs are primary data, not rebuildable."""
+    return _data_dir() / "blobs"
+
+
+def _app_support_dir() -> Path:
+    return Path(os.environ.get("HEKB_APP_SUPPORT_DIR", DEFAULT_APP_SUPPORT_DIR)).resolve()
+
+
+def _index_dir() -> Path:
+    """Layer 5 (index): deliberately NOT under `_data_dir()` -- HEKBV3-BUILD001's own
+    constraint is that large index files stay on the VM's local disk even when
+    HEKB_DATA_DIR points at a network/shared-folder mount. Defaults under the (always
+    local) app-support dir; overridable via HEKB_INDEX_DIR for tests."""
+    return Path(os.environ.get("HEKB_INDEX_DIR", str(_app_support_dir() / "index"))).resolve()
 
 
 def _object_path(object_id: str) -> Path:
@@ -365,8 +393,8 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "hekb-vnext"}
+def health() -> dict[str, Any]:
+    return {"status": "ok", "service": "hekb-vnext", "api_versions": API_VERSIONS}
 
 
 def _load_audit_public_key() -> ec.EllipticCurvePublicKey:
@@ -1020,6 +1048,356 @@ def get_recalibration_job(job_id: str) -> dict[str, Any]:
     return job.result
 
 
+# ---------------------------------------------------------------------------
+# /v3/ -- Trajectory storage and reuse (HEKBv3 改修設計書 v0.1 §3-§5, §8 段階1-2;
+# experience channel only, 追補A §6). Additive only: none of the routes above are
+# changed (H1, K6).
+# ---------------------------------------------------------------------------
+
+
+class SpaceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_ref: str
+    layer: int
+    projection_sha256: str
+    w_sha256: str
+    anchor_policy_sha256: str
+    wiring_policy_sha256: str
+    time_policy_sha256: str
+    board_format: str
+    quant_step_log2: int
+    #: only when valueless columns were dropped at ingest (index/space_id.py OPTIONAL_KEYS)
+    excluded_columns: str | None = None
+
+
+class SpaceIdOut(BaseModel):
+    space_id: str
+
+
+@app.post("/v3/space-id", response_model=SpaceIdOut)
+def compute_space_id_route(space: SpaceIn) -> SpaceIdOut:
+    """Not in the design doc's own endpoint table (§5) -- added so a caller can get the
+    space_id it must embed in ext.hekbv3.space without recomputing BLAKE2b-256 client-side.
+    Read-only, no side effects."""
+    try:
+        return SpaceIdOut(space_id=compute_space_id(space.model_dump(exclude_none=True)))
+    except SpaceIdError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/v3/blobs/{sha256}", status_code=201)
+async def put_blob_route(sha256: str, request: Request) -> dict[str, Any]:
+    """§5: 'blob の保存。受け取ったバイト列の sha256 が一致しなければ拒否。不変.'
+    No signature required (not marked 署名必須 in §5's own table)."""
+    data = await request.body()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise HTTPException(status_code=422, detail="sha256 path segment must be 64 hex characters")
+    try:
+        stored_hex = blob_store.put_blob(_blobs_dir(), sha256, data)
+    except blob_store.BlobError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"sha256": stored_hex, "bytes": len(data)}
+
+
+@app.get("/v3/blobs/{sha256}")
+async def get_blob_route(sha256: str) -> Response:
+    try:
+        data = blob_store.get_blob(_blobs_dir(), sha256)
+    except blob_store.BlobError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=data, media_type="application/octet-stream")
+
+
+def _require_hekbv3_trajectory_ext(payload: ExperiencePayload) -> dict[str, Any]:
+    """Shape-checks ext.hekbv3 for kind=='trajectory' (§3.1); `ext` itself stays
+    schema-free at the Pydantic level (existing design), so this validates by hand."""
+    ext = payload.ext.get("hekbv3")
+    if not isinstance(ext, dict):
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3 is required for /v3/trajectories")
+    if ext.get("kind") != "trajectory":
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3.kind must be 'trajectory'")
+    if ext.get("origin") != "experience":
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3.origin must be 'experience' (knowledge channel not implemented, 追補A §6)")
+    space = ext.get("space")
+    if not isinstance(space, dict) or "space_id" not in space:
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3.space (with space_id) is required")
+    try:
+        recomputed = compute_space_id({k: v for k, v in space.items() if k != "space_id"})
+    except SpaceIdError as exc:
+        raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.space: {exc}") from exc
+    if recomputed != space["space_id"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"payload.ext.hekbv3.space.space_id {space['space_id']!r} does not match "
+                    f"the recomputed value {recomputed!r} for the given space fields",
+        )
+    # [HEKBV3-BUILD002, disclosed]: `trajectory` (the 64-D position blob, used only by R1)
+    # is OPTIONAL -- BoardRecord-sourced sessions (nvs-runtime replay executor, no
+    # position series) have no position to carry. `ports` stays required: it is the only
+    # thing build_index() reads (see index/experience_index.py), so dropping it would make
+    # the index unrebuildable from objects+blobs alone.
+    for key in ("trajectory", "ports"):
+        ref = ext.get(key)
+        if ref is None and key == "trajectory":
+            continue
+        if not isinstance(ref, dict) or "blob_sha256" not in ref:
+            raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.{key}.blob_sha256 is required")
+        if not blob_store.has_blob(_blobs_dir(), ref["blob_sha256"]):
+            raise HTTPException(
+                status_code=404,
+                detail=f"payload.ext.hekbv3.{key}.blob_sha256 {ref['blob_sha256']!r} not found; "
+                       f"PUT /v3/blobs/{{sha256}} before POST /v3/trajectories",
+            )
+    _require_causal_log(ext)
+    return ext
+
+
+#: D-03/D-24: the causal log's own "ports" field must carry every one of the 38 Core
+#: Ports' raw readings -- not whatever subset `ext.hekbv3.ports.port_ids` happens to
+#: list (that can legitimately be the 32-cell board's own excluded-6 subset; the causal
+#: log is the one place that is never true of).
+_ALL_38_PORT_IDS = tuple(f"P{n:02d}" for n in range(1, 39))
+
+
+def _require_causal_log(ext: dict[str, Any]) -> None:
+    """D-03/D-24 (feature/require-causal-log): a trajectory experience must carry its
+    causal log -- every one of the 38 Core Ports' raw reading and the raw cycle, for
+    every token -- unless the caller explicitly says it is omitting one on purpose
+    (`causal_log_omitted_reason`, a non-empty string recorded verbatim on the stored
+    experience, never silently). This is a deliberate tightening of the OPTIONAL rule
+    HEKBV3-BUILD004 shipped (older ingests had no causal log at all); callers that
+    legitimately have none -- e.g. `scripts/ingest_boardrecords.py` without
+    --raw-logs-root -- now have to say so."""
+    causal_log = ext.get("causal_log")
+    omitted_reason = ext.get("causal_log_omitted_reason")
+
+    if causal_log is None:
+        if not isinstance(omitted_reason, str) or not omitted_reason.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="payload.ext.hekbv3.causal_log is required (D-03/D-24); set "
+                       "payload.ext.hekbv3.causal_log_omitted_reason to a non-empty string "
+                       "to explicitly omit it instead",
+            )
+        return
+
+    if not isinstance(causal_log, dict) or "blob_sha256" not in causal_log:
+        raise HTTPException(status_code=422, detail="payload.ext.hekbv3.causal_log.blob_sha256 is required")
+    blob_sha256 = causal_log["blob_sha256"]
+    if not blob_store.has_blob(_blobs_dir(), blob_sha256):
+        raise HTTPException(
+            status_code=404,
+            detail=f"payload.ext.hekbv3.causal_log.blob_sha256 {blob_sha256!r} not found; "
+                   f"PUT /v3/blobs/{{sha256}} before POST /v3/trajectories",
+        )
+
+    data = blob_store.get_blob(_blobs_dir(), blob_sha256)
+    try:
+        records = causal_log_blob.decode_causal_log_blob(data)
+    except causal_log_blob.CausalLogBlobError as exc:
+        raise HTTPException(status_code=422, detail=f"payload.ext.hekbv3.causal_log blob is malformed: {exc}") from exc
+
+    declared_n_steps = causal_log.get("n_steps")
+    if declared_n_steps is not None and declared_n_steps != len(records):
+        raise HTTPException(
+            status_code=422,
+            detail=f"payload.ext.hekbv3.causal_log.n_steps={declared_n_steps} but the blob "
+                   f"has {len(records)} record(s)",
+        )
+    if causal_log.get("schema") == causal_log_blob.SCHEMA_V2:
+        for i, record in enumerate(records):
+            try:
+                causal_log_blob.validate_provenance(i, record)
+            except causal_log_blob.CausalLogBlobError as exc:
+                raise HTTPException(status_code=422, detail=f"causal_log provenance contract: {exc}") from exc
+    for i, record in enumerate(records):
+        if "cycle_raw" not in record or record["cycle_raw"] is None:
+            raise HTTPException(status_code=422, detail=f"causal_log record {i} is missing cycle_raw")
+        ports = record.get("ports")
+        if not isinstance(ports, dict):
+            raise HTTPException(status_code=422, detail=f"causal_log record {i} is missing ports")
+        missing_ports = [p for p in _ALL_38_PORT_IDS if p not in ports]
+        if missing_ports:
+            raise HTTPException(
+                status_code=422,
+                detail=f"causal_log record {i} is missing port(s): {missing_ports}",
+            )
+
+
+@app.post("/v3/trajectories", response_model=ExperienceOut, status_code=201)
+def create_trajectory(
+    body: ExperienceIn,
+    x_audit_signature: str | None = Header(None, alias="X-Audit-Signature"),
+) -> ExperienceOut:
+    """§5: 'Trajectory の Experience を保存 (ext.hekbv3、blob の参照)。署名必須.'
+    H6: the payload itself carries only blob_sha256 strings, never raw float bits --
+    enforced structurally by ExperiencePayload/`_require_hekbv3_trajectory_ext` (the
+    floats live inside the already-stored blobs, outside the hashed Layer-1 payload)."""
+    if body.payload.schema_ not in ("hekb.experience/1", "hekb.experience/2"):
+        raise HTTPException(status_code=422, detail=f"unsupported schema {body.payload.schema_!r}")
+    _ensure_layout()
+    _blobs_dir().mkdir(parents=True, exist_ok=True)
+    _require_hekbv3_trajectory_ext(body.payload)
+    return create_experience(body, x_audit_signature)
+
+
+class IndexBuildIn(BaseModel):
+    l: int = Field(experience_index.DEFAULT_L, alias="L", description="Window length in tokens.")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class IndexBuildOut(BaseModel):
+    space_id: str
+    index_sha256: str
+    n_entries: int
+    d_kept: int
+
+
+@app.post("/v3/index/{space_id}/build", response_model=IndexBuildOut, status_code=202)
+def build_index_route(space_id: str, body: IndexBuildIn | None = None) -> IndexBuildOut:
+    """§5: 'index の(再)構築。objects と blobs を読むだけ.' Writes only under `_index_dir()`
+    (local disk, never the shared-folder data dir) -- never touches objects/blobs/
+    relations/meta (K7's own guarantee extended to this route by construction)."""
+    _ensure_layout()
+    l = body.l if body is not None else experience_index.DEFAULT_L
+    try:
+        meta = experience_index.build_index(_objects_dir(), _blobs_dir(), _index_dir(), space_id, l=l)
+    except experience_index.IndexError_ as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return IndexBuildOut(space_id=space_id, index_sha256=meta["index_sha256"],
+                         n_entries=meta["n_entries"], d_kept=meta["d_kept"])
+
+
+class ComposeExclude(BaseModel):
+    groups: list[str] = Field(default_factory=list)
+    object_ids: list[str] = Field(default_factory=list)
+
+
+class ComposeIn(BaseModel):
+    space_id: str
+    query_object_id: str
+    query_token_index: int
+    source: str = "experience"
+    temperature: float | None = Field(None, description="T; if omitted, a kNN-bandwidth default is computed from the (post-exclude) library.")
+    top_m: int = 64
+    exclude: ComposeExclude = Field(default_factory=ComposeExclude)
+    laplace_alpha: float | None = Field(None, description="R3 smoothing alpha; defaults to 1/K (K = categories in the post-exclude library).")
+
+
+class ComposeOut(BaseModel):
+    space_id: str
+    support_s: float
+    n_eff: float
+    temperature_used: float
+    weights: list[float]
+    neighbor_object_ids: list[str]
+    neighbor_token_indices: list[int]
+    value_by_horizon: dict[str, list[float] | None]
+    category_posterior: dict[str, float]
+
+
+def _default_temperature(keys: np.ndarray, k: int = 16, max_n: int = 2000, seed: int = 0) -> float:
+    """EXP-HEKBv3_実験設計_v0.1 §(M2): 'T0 = 訓練側の query の、16番目の近傍までの距離の二乗の中央値.'
+    Computed self-referentially over the library passed in (already exclude-filtered by
+    the caller) -- this build has no separate train/val split to draw T0 from.
+
+    [HEKBV3-BUILD001, disclosed]: the naive (n, n, d) broadcast materializes an array of
+    size n*n*d -- observed to need 36.5 GiB and crash at n=12,471 (TRJ003's real per-token
+    index). Rewritten with the ||a-b||^2 = ||a||^2 + ||b||^2 - 2a.b expansion, which needs
+    only an (n, n) matrix (BLAS-backed), and additionally subsamples down to `max_n` rows
+    (fixed seed, so T0 is still reproducible, K8) when the library is larger than that --
+    a kNN-bandwidth estimate does not need every point, only enough of them."""
+    n = keys.shape[0]
+    if n > max_n:
+        rng = np.random.default_rng(seed)
+        keys = keys[rng.choice(n, size=max_n, replace=False)]
+        n = max_n
+    kk = min(k, n - 1)
+    if kk < 1:
+        return 1.0
+    sq_norms = np.sum(keys ** 2, axis=1)
+    d2 = sq_norms[:, None] + sq_norms[None, :] - 2.0 * (keys @ keys.T)
+    np.fill_diagonal(d2, np.inf)
+    kth = np.partition(d2, kk - 1, axis=1)[:, kk - 1]
+    return float(np.median(kth)) or 1.0
+
+
+@app.post("/v3/compose", response_model=ComposeOut)
+def compose_route(body: ComposeIn) -> ComposeOut:
+    """§5: 'query から重み・支持・合成の結果を返す...副作用: なし [H7].' Never writes
+    recall_count/objects/blobs/relations/meta (K7)."""
+    if body.source != "experience":
+        raise HTTPException(status_code=422, detail="only source='experience' is implemented (追補A §6 決定⑤: knowledge channel not built yet)")
+    try:
+        keys, entries, meta = experience_index.load_index(_index_dir(), body.space_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no index built for space_id={body.space_id!r}: {exc}") from exc
+
+    exclude_groups = set(body.exclude.groups)
+    exclude_object_ids = set(body.exclude.object_ids) | {body.query_object_id}
+
+    keep_mask = np.array([
+        (e["group"] not in exclude_groups) and (e["object_id"] not in exclude_object_ids)
+        for e in entries
+    ])
+    if not keep_mask.any():
+        raise HTTPException(status_code=422, detail="every library entry was excluded; nothing to compose against")
+    temperature = body.temperature if body.temperature is not None else _default_temperature(keys[keep_mask])
+
+    try:
+        record = _read_json(_object_path(body.query_object_id))
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"query_object_id {body.query_object_id!r} not found")
+        ext = record["payload"]["ext"]["hekbv3"]
+        if ext["space"]["space_id"] != body.space_id:
+            raise HTTPException(status_code=409, detail="query_object_id's space_id does not match the target index's space_id [H5]")
+        ports_ref = ext["ports"]
+        port_ids = ports_ref["port_ids"]
+        ports_series = experience_index.decode_ports_series(ports_ref, _blobs_dir())
+        if not (0 <= body.query_token_index < ports_series.shape[0]):
+            raise HTTPException(status_code=422, detail=f"query_token_index {body.query_token_index} out of range")
+        l = meta["l"]
+        if body.query_token_index < l - 1:
+            raise HTTPException(status_code=422, detail=f"query_token_index {body.query_token_index} is before the first valid window (needs >= {l - 1})")
+        col_idx = [port_ids.index(p) for p in experience_index.ANCHOR_INDEPENDENT_10]
+        window = ports_series[body.query_token_index - l + 1: body.query_token_index + 1, col_idx]
+        raw_feature = window.reshape(-1)
+        # [HEKBV3-BUILD002, disclosed]: a position-less Trajectory (BoardRecord-sourced,
+        # no ext.hekbv3.trajectory) returns R3 only -- R1 needs each neighbour's own
+        # position series, which doesn't exist here.
+        skip_r1 = "trajectory" not in ext
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"query_object_id is missing expected ext.hekbv3 field: {exc}") from exc
+    except experience_index.IndexError_ as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    query_standardized = compose_mod.standardize_query(raw_feature, meta["mean"], meta["std"], meta["kept_dims"])
+
+    try:
+        result = compose_mod.compose(
+            query_standardized=query_standardized,
+            query_object_id=body.query_object_id,
+            query_token_index=body.query_token_index,
+            keys=keys, entries=entries,
+            objects_dir=_objects_dir(), blobs_root=_blobs_dir(),
+            temperature=temperature, top_m=body.top_m,
+            exclude_groups=exclude_groups, exclude_object_ids=exclude_object_ids,
+            laplace_alpha=body.laplace_alpha,
+            skip_r1=skip_r1,
+        )
+    except compose_mod.ComposeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return ComposeOut(
+        space_id=body.space_id, support_s=result.support_s, n_eff=result.n_eff,
+        temperature_used=temperature, weights=result.weights,
+        neighbor_object_ids=result.neighbor_object_ids,
+        neighbor_token_indices=result.neighbor_token_indices,
+        value_by_horizon={str(h): v for h, v in result.value_by_horizon.items()},
+        category_posterior=result.category_posterior,
+    )
+
+
 def main() -> None:
     import asyncio
 
@@ -1060,6 +1438,11 @@ def main() -> None:
 
     asyncio.run(_run())
 
+
+# Graph layer (GRAPH_SEARCH v0.1): read-only routes beside the existing ones; no existing route changes.
+from graph.api import make_router as _graph_router  # noqa: E402
+
+app.include_router(_graph_router(_data_dir))
 
 if __name__ == "__main__":
     main()

@@ -35,12 +35,28 @@ import tempfile
 from itertools import combinations
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path("/Users/tomonam3/Projects/sensos/experiments/EXP-BABY-MAC005")))
 sys.path.insert(0, str(Path("/Users/tomonam3/Projects/sensos/experiments/EXP-BABY-MAC002")))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mac005_data_loader import load_mac001_trajectories  # noqa: E402
-from mlba_core_bridge import pairwise_distance  # noqa: E402
+# Both are Mac-local only: real files under a specific Mac's
+# ~/Projects/sensos/experiments/ tree (sys.path inserts above), not
+# pip-installable, so not something requirements-dev.txt can provide.
+# Everywhere else (CI, a fresh clone, another contributor's machine),
+# this whole module has nothing to test and should skip with a reason
+# instead of erroring at collection time.
+mac005_data_loader = pytest.importorskip(
+    "mac005_data_loader",
+    reason="EXP-BABY-MAC005's mac005_data_loader is Mac-local only (not pip-installable)",
+)
+mlba_core_bridge = pytest.importorskip(
+    "mlba_core_bridge",
+    reason="EXP-BABY-MAC002's mlba_core_bridge (Rust FFI) is Mac-local only (not pip-installable)",
+)
+load_mac001_trajectories = mac005_data_loader.load_mac001_trajectories
+pairwise_distance = mlba_core_bridge.pairwise_distance
 from storage.trajectory_blob import write_trajectory, read_trajectory  # noqa: E402
 
 MAC001_GROUND_TRUTH_CSV = Path(
