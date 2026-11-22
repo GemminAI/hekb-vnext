@@ -1,0 +1,14 @@
+{
+ "source": "sensos feature/gate-meaning-frame (c01f6b6917b85f4bd3d6cc5ee2f7f68990803bf3), docs/architecture/contracts/nvs/gate-verdict.schema.json (gate-verdict/1; L2.kind includes meaning_frame and meaning_measurement)",
+ "note": "gate-verdict.schema.json is a byte-for-byte copy. validate.py is authored in hekb-vnext (no source file): hekb-vnext has no jsonschema, so it implements the keywords the schema uses (and refuses a schema that uses others); it is checked against jsonschema in tests/test_gate_verdict_vendor.py. jcs.py for the envelope_sha256 / verdict_sha256 is the existing vendor/sensos_ic00/jcs.py (LOCK there).",
+ "files": {
+  "gate-verdict.schema.json": {
+   "source_sha256": "4358d4d02d6ee26af3d450fdff029036b2a2ce4d5500912171b9d3a984e3971b",
+   "vendored_sha256": "4358d4d02d6ee26af3d450fdff029036b2a2ce4d5500912171b9d3a984e3971b"
+  },
+  "validate.py": {
+   "source_sha256": null,
+   "vendored_sha256": "6004a853d4341f56fdcbd8adfb77420fa87c40f81246c8a01dd25511a68a208d"
+  }
+ }
+}
